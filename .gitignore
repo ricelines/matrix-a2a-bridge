@@ -1,0 +1,5 @@
+/.gocache/
+/.gomodcache/
+/matrix-bot
+/.env
+/data/
