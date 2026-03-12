@@ -8,21 +8,29 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
+	"onboarding/internal/agent"
 	"onboarding/internal/config"
 	"onboarding/internal/state"
 )
 
 type Bot struct {
-	client *mautrix.Client
-	config config.Config
-	log    *slog.Logger
-	state  *state.Store
+	client   *mautrix.Client
+	config   config.Config
+	log      *slog.Logger
+	state    *state.Store
+	agent    *agent.Client
+	users    *userDirectory
+	sessions *sessionManager
+
+	roomPeersMu sync.Mutex
+	roomPeers   map[id.RoomID]id.UserID
 }
 
 func New(cfg config.Config, logger *slog.Logger) (*Bot, error) {
@@ -49,10 +57,13 @@ func New(cfg config.Config, logger *slog.Logger) (*Bot, error) {
 	client.DefaultHTTPBackoff = 2 * time.Second
 
 	bot := &Bot{
-		client: client,
-		config: cfg,
-		log:    logger,
-		state:  stateStore,
+		client:    client,
+		config:    cfg,
+		log:       logger,
+		state:     stateStore,
+		users:     newUserDirectory(client),
+		sessions:  newSessionManager(cfg.SessionIdleTimeout),
+		roomPeers: make(map[id.RoomID]id.UserID),
 	}
 	bot.registerHandlers()
 	return bot, nil
@@ -63,11 +74,20 @@ func (b *Bot) Run(ctx context.Context) error {
 		return err
 	}
 
-	b.log.Info("starting matrix bot",
+	a2aClient, err := agent.New(ctx, b.config.A2AAgentURL)
+	if err != nil {
+		return fmt.Errorf("connect to A2A agent: %w", err)
+	}
+	b.agent = a2aClient
+
+	go b.runSessionReaper(ctx)
+
+	b.log.Info("starting onboarding bot",
 		"user_id", b.client.UserID.String(),
 		"homeserver", b.client.HomeserverURL.String(),
-		"command_prefix", b.config.CommandPrefix,
 		"state_path", b.config.StatePath,
+		"a2a_agent_url", b.config.A2AAgentURL,
+		"session_idle_timeout", b.config.SessionIdleTimeout.String(),
 	)
 
 	for {
@@ -105,7 +125,7 @@ func (b *Bot) loginWithPassword(ctx context.Context) error {
 			User: usernameForLogin(b.config.Username),
 		},
 		Password:                 b.config.Password,
-		InitialDeviceDisplayName: "matrix-bot",
+		InitialDeviceDisplayName: "onboarding-bot",
 		StoreCredentials:         true,
 	}
 	if b.client.DeviceID != "" {
@@ -145,29 +165,38 @@ func (b *Bot) registerHandlers() {
 }
 
 func (b *Bot) handleMemberEvent(ctx context.Context, evt *event.Event) {
-	if !b.config.AutoJoinInvites {
-		return
-	}
 	if evt.GetStateKey() != b.client.UserID.String() {
 		return
 	}
-	if evt.Content.AsMember().Membership != event.MembershipInvite {
+	if evt.ID != "" && b.state.IsHandled(evt.ID.String()) {
 		return
 	}
 
-	if _, err := b.client.JoinRoomByID(ctx, evt.RoomID); err != nil {
-		b.log.Error("failed to join invited room",
-			"room_id", evt.RoomID.String(),
-			"sender", evt.Sender.String(),
-			"err", err,
-		)
+	member := evt.Content.AsMember()
+	switch member.Membership {
+	case event.MembershipInvite:
+		if !b.config.AutoJoinInvites {
+			return
+		}
+		if _, err := b.client.JoinRoomByID(ctx, evt.RoomID); err != nil {
+			b.log.Error("failed to join invited room",
+				"room_id", evt.RoomID.String(),
+				"sender", evt.Sender.String(),
+				"err", err,
+			)
+			return
+		}
+
+		b.rememberRoomPeer(evt.RoomID, evt.Sender)
+		b.startOnboardingIfNeeded(ctx, evt.RoomID, evt.Sender, evt.ID.String(), false)
+	case event.MembershipJoin:
+		if evt.Sender != b.client.UserID {
+			return
+		}
+		b.startOnboardingIfNeeded(ctx, evt.RoomID, "", evt.ID.String(), true)
+	default:
 		return
 	}
-
-	b.log.Info("joined invited room",
-		"room_id", evt.RoomID.String(),
-		"sender", evt.Sender.String(),
-	)
 }
 
 func (b *Bot) handleMessageEvent(ctx context.Context, evt *event.Event) {
@@ -184,66 +213,381 @@ func (b *Bot) handleMessageEvent(ctx context.Context, evt *event.Event) {
 	}
 
 	body := strings.TrimSpace(message.Body)
-	if !strings.HasPrefix(body, b.config.CommandPrefix) {
+	if body == "" {
 		return
 	}
 
-	reply := b.handleCommand(strings.TrimSpace(strings.TrimPrefix(body, b.config.CommandPrefix)))
-	if reply == "" {
-		return
-	}
-
-	content := &event.MessageEventContent{
-		MsgType: event.MsgNotice,
-		Body:    reply,
-	}
-	if _, err := b.client.SendMessageEvent(ctx, evt.RoomID, event.EventMessage, content, mautrix.ReqSendEvent{
-		TransactionID: stableTransactionID("command-reply", evt.ID.String()),
-	}); err != nil {
-		b.log.Error("failed to send reply",
+	userID, ok, err := b.resolveDirectPeer(ctx, evt.RoomID)
+	if err != nil {
+		b.log.Error("failed to resolve direct-message peer",
 			"room_id", evt.RoomID.String(),
+			"event_id", evt.ID.String(),
+			"err", err,
+		)
+		if b.replyWithFailure(ctx, evt.RoomID, stableTransactionID("message-failure", evt.ID.String())) == nil {
+			_ = b.markHandledEvent(evt.ID.String(), "message")
+		}
+		return
+	}
+	if !ok {
+		return
+	}
+
+	record, err := b.users.Load(ctx, userID)
+	if err != nil {
+		b.log.Error("failed to load user onboarding record",
+			"room_id", evt.RoomID.String(),
+			"user_id", userID.String(),
+			"err", err,
+		)
+		if b.replyWithFailure(ctx, evt.RoomID, stableTransactionID("message-failure", evt.ID.String())) == nil {
+			_ = b.markHandledEvent(evt.ID.String(), "message")
+		}
+		return
+	}
+
+	now := time.Now().UTC()
+	if expired, ok := b.sessions.ExpireRoom(evt.RoomID, now); ok {
+		b.cancelSession(ctx, expired)
+	}
+
+	req := agent.Request{
+		Text:      body,
+		ContextID: record.ContextID,
+		Metadata:  requestMetadata(evt.RoomID, userID, conversationMode(record), "message"),
+	}
+	if current, ok := b.sessions.Active(evt.RoomID, now); ok {
+		req.TaskID = current.TaskID
+		if current.ContextID != "" {
+			req.ContextID = current.ContextID
+		}
+	}
+
+	reply, err := b.agent.Send(ctx, req)
+	if err != nil {
+		b.log.Error("failed to route message through A2A",
+			"room_id", evt.RoomID.String(),
+			"user_id", userID.String(),
+			"event_id", evt.ID.String(),
+			"err", err,
+		)
+		if b.replyWithFailure(ctx, evt.RoomID, stableTransactionID("message-failure", evt.ID.String())) == nil {
+			_ = b.markHandledEvent(evt.ID.String(), "message")
+		}
+		return
+	}
+
+	replyBody := b.renderReply(record, reply)
+	if replyBody == "" {
+		replyBody = "I'm still here, but I didn't get a usable reply from the agent endpoint."
+	}
+	if err := b.sendText(ctx, evt.RoomID, stableTransactionID("message-reply", evt.ID.String()), replyBody); err != nil {
+		b.log.Error("failed to send chat reply",
+			"room_id", evt.RoomID.String(),
+			"user_id", userID.String(),
 			"event_id", evt.ID.String(),
 			"err", err,
 		)
 		return
 	}
-	if evt.ID != "" {
-		if err := b.state.MarkHandled(evt.ID.String()); err != nil {
-			b.log.Error("failed to persist handled event",
-				"room_id", evt.RoomID.String(),
-				"event_id", evt.ID.String(),
-				"err", err,
-			)
-		}
+
+	if err := b.persistReplyState(ctx, evt.RoomID, userID, record, reply, now); err != nil {
+		b.log.Error("failed to persist conversation state",
+			"room_id", evt.RoomID.String(),
+			"user_id", userID.String(),
+			"event_id", evt.ID.String(),
+			"err", err,
+		)
+		return
 	}
 
-	b.log.Info("replied to command",
-		"room_id", evt.RoomID.String(),
-		"sender", evt.Sender.String(),
-		"command", body,
-	)
+	_ = b.markHandledEvent(evt.ID.String(), "message")
 }
 
-func (b *Bot) handleCommand(commandLine string) string {
-	if commandLine == "" {
-		return fmt.Sprintf("Try %shelp", b.config.CommandPrefix)
+func (b *Bot) renderReply(record userRecord, reply agent.Response) string {
+	var parts []string
+	if text := strings.TrimSpace(reply.Reply); text != "" {
+		parts = append(parts, text)
 	}
 
-	fields := strings.Fields(commandLine)
-	switch strings.ToLower(fields[0]) {
-	case "help":
-		return fmt.Sprintf("Commands: %sping, %secho <text>, %shelp", b.config.CommandPrefix, b.config.CommandPrefix, b.config.CommandPrefix)
-	case "ping":
-		return "pong"
-	case "echo":
-		payload := strings.TrimSpace(strings.TrimPrefix(commandLine, fields[0]))
-		if payload == "" {
-			return fmt.Sprintf("Usage: %secho <text>", b.config.CommandPrefix)
+	effectiveOnboarded := record.Onboarded() || reply.CompleteOnboarding
+	for _, command := range reply.Commands {
+		if stub := renderCommandStub(command, effectiveOnboarded); stub != "" {
+			parts = append(parts, stub)
 		}
-		return payload
-	default:
-		return fmt.Sprintf("Unknown command %q. Try %shelp", fields[0], b.config.CommandPrefix)
 	}
+
+	return strings.TrimSpace(strings.Join(parts, "\n\n"))
+}
+
+func (b *Bot) startOnboardingIfNeeded(ctx context.Context, roomID id.RoomID, hintedUserID id.UserID, sourceEventID string, requireFreshContext bool) {
+	now := time.Now().UTC()
+	if current, ok := b.sessions.Active(roomID, now); ok && current.TaskID != "" {
+		_ = b.markHandledEvent(sourceEventID, "member")
+		return
+	}
+
+	userID := hintedUserID
+	if userID == "" {
+		resolvedUserID, ok, err := b.resolveDirectPeer(ctx, roomID)
+		if err != nil {
+			b.log.Error("failed to resolve direct-message peer during onboarding start",
+				"room_id", roomID.String(),
+				"err", err,
+			)
+			return
+		}
+		if !ok {
+			_ = b.markHandledEvent(sourceEventID, "member")
+			return
+		}
+		userID = resolvedUserID
+	}
+
+	record, err := b.users.Load(ctx, userID)
+	if err != nil {
+		b.log.Error("failed to load user onboarding record",
+			"room_id", roomID.String(),
+			"user_id", userID.String(),
+			"err", err,
+		)
+		if b.replyWithFailure(ctx, roomID, stableTransactionID("invite-failure", sourceEventID)) == nil {
+			_ = b.markHandledEvent(sourceEventID, "member")
+		}
+		return
+	}
+	if record.Onboarded() {
+		_ = b.markHandledEvent(sourceEventID, "member")
+		return
+	}
+	if requireFreshContext && record.ContextID != "" {
+		_ = b.markHandledEvent(sourceEventID, "member")
+		return
+	}
+
+	reply, err := b.agent.Send(ctx, agent.Request{
+		Text:      "",
+		ContextID: record.ContextID,
+		Metadata:  requestMetadata(roomID, userID, "onboarding", "invite"),
+	})
+	if err != nil {
+		b.log.Error("failed to start onboarding via A2A",
+			"room_id", roomID.String(),
+			"user_id", userID.String(),
+			"err", err,
+		)
+		if b.replyWithFailure(ctx, roomID, stableTransactionID("invite-failure", sourceEventID)) == nil {
+			_ = b.markHandledEvent(sourceEventID, "member")
+		}
+		return
+	}
+
+	body := b.renderReply(record, reply)
+	if body == "" {
+		body = "Welcome. I'm ready to get you onboarded."
+	}
+	if err := b.sendText(ctx, roomID, stableTransactionID("invite-reply", sourceEventID), body); err != nil {
+		b.log.Error("failed to send onboarding opening message",
+			"room_id", roomID.String(),
+			"user_id", userID.String(),
+			"err", err,
+		)
+		return
+	}
+
+	if err := b.persistReplyState(ctx, roomID, userID, record, reply, now); err != nil {
+		b.log.Error("failed to persist onboarding state",
+			"room_id", roomID.String(),
+			"user_id", userID.String(),
+			"err", err,
+		)
+		return
+	}
+	_ = b.markHandledEvent(sourceEventID, "member")
+}
+
+func renderCommandStub(command agent.Command, onboarded bool) string {
+	switch command.Name {
+	case "help":
+		return "Stubbed actions available right now: I can explain the bot wiring, confirm your onboarding state, and keep the session lifecycle clean while the real actions are being built."
+	case "status":
+		if onboarded {
+			return "Your onboarding record is set, and the action layer is still a stub."
+		}
+		return "You're still in onboarding, and the action layer is still a stub."
+	case "close_session":
+		return ""
+	default:
+		return "I parsed a command, but the concrete action is still a stub."
+	}
+}
+
+func (b *Bot) persistReplyState(ctx context.Context, roomID id.RoomID, userID id.UserID, record userRecord, reply agent.Response, now time.Time) error {
+	updated := record
+	changed := false
+
+	if reply.ContextID != "" && reply.ContextID != updated.ContextID {
+		updated.ContextID = reply.ContextID
+		changed = true
+	}
+	if reply.CompleteOnboarding && !updated.Onboarded() {
+		timestamp := now
+		updated.OnboardedAt = &timestamp
+		changed = true
+	}
+
+	if changed {
+		if err := b.users.Save(ctx, userID, updated); err != nil {
+			return err
+		}
+	}
+
+	if reply.CloseSession || reply.State.Terminal() || reply.TaskID == "" {
+		b.sessions.Remove(roomID)
+		return nil
+	}
+
+	contextID := updated.ContextID
+	if contextID == "" {
+		contextID = reply.ContextID
+	}
+	b.sessions.Put(session{
+		RoomID:       roomID,
+		UserID:       userID,
+		TaskID:       reply.TaskID,
+		ContextID:    contextID,
+		LastActivity: now,
+	})
+	return nil
+}
+
+func (b *Bot) runSessionReaper(ctx context.Context) {
+	tickerInterval := minDuration(30*time.Second, maxDuration(time.Second, b.config.SessionIdleTimeout/2))
+	ticker := time.NewTicker(tickerInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			for _, expired := range b.sessions.Expired(time.Now().UTC()) {
+				b.cancelSession(ctx, expired)
+			}
+		}
+	}
+}
+
+func (b *Bot) cancelSession(ctx context.Context, current session) {
+	if current.TaskID == "" {
+		return
+	}
+	if err := b.agent.CancelTask(ctx, current.TaskID); err != nil {
+		b.log.Warn("failed to cancel expired A2A task",
+			"room_id", current.RoomID.String(),
+			"user_id", current.UserID.String(),
+			"task_id", current.TaskID,
+			"err", err,
+		)
+	}
+}
+
+func (b *Bot) resolveDirectPeer(ctx context.Context, roomID id.RoomID) (id.UserID, bool, error) {
+	if cached, ok := b.cachedRoomPeer(roomID); ok {
+		return cached, true, nil
+	}
+
+	members, err := b.client.JoinedMembers(ctx, roomID)
+	if err != nil {
+		return "", false, fmt.Errorf("load joined members: %w", err)
+	}
+	if len(members.Joined) != 2 {
+		return "", false, nil
+	}
+
+	for userID := range members.Joined {
+		if userID == b.client.UserID {
+			continue
+		}
+		b.rememberRoomPeer(roomID, userID)
+		return userID, true, nil
+	}
+	return "", false, nil
+}
+
+func (b *Bot) rememberRoomPeer(roomID id.RoomID, userID id.UserID) {
+	b.roomPeersMu.Lock()
+	defer b.roomPeersMu.Unlock()
+
+	b.roomPeers[roomID] = userID
+}
+
+func (b *Bot) cachedRoomPeer(roomID id.RoomID) (id.UserID, bool) {
+	b.roomPeersMu.Lock()
+	defer b.roomPeersMu.Unlock()
+
+	userID, ok := b.roomPeers[roomID]
+	return userID, ok
+}
+
+func (b *Bot) replyWithFailure(ctx context.Context, roomID id.RoomID, txnID string) error {
+	if err := b.sendText(ctx, roomID, txnID, "I hit a temporary internal problem while trying to continue the conversation. Please send that again in a moment."); err != nil {
+		b.log.Error("failed to send failure message",
+			"room_id", roomID.String(),
+			"err", err,
+		)
+		return err
+	}
+	return nil
+}
+
+func (b *Bot) sendText(ctx context.Context, roomID id.RoomID, txnID, body string) error {
+	content := &event.MessageEventContent{
+		MsgType: event.MsgText,
+		Body:    body,
+	}
+	_, err := b.client.SendMessageEvent(ctx, roomID, event.EventMessage, content, mautrix.ReqSendEvent{
+		TransactionID: txnID,
+	})
+	if err != nil {
+		return fmt.Errorf("send message event: %w", err)
+	}
+	return nil
+}
+
+func (b *Bot) markHandledEvent(eventID, eventKind string) error {
+	if eventID == "" {
+		return nil
+	}
+	if err := b.state.MarkHandled(eventID); err != nil {
+		b.log.Error("failed to persist handled event",
+			"event_id", eventID,
+			"event_kind", eventKind,
+			"err", err,
+		)
+		return err
+	}
+	return nil
+}
+
+func requestMetadata(roomID id.RoomID, userID id.UserID, mode, trigger string) map[string]any {
+	return map[string]any{
+		"matrix": map[string]any{
+			"room_id": roomID.String(),
+			"user_id": userID.String(),
+		},
+		"workflow": map[string]any{
+			"mode":    mode,
+			"trigger": trigger,
+		},
+	}
+}
+
+func conversationMode(record userRecord) string {
+	if record.Onboarded() {
+		return "general"
+	}
+	return "onboarding"
 }
 
 func (b *Bot) syncWithResume(ctx context.Context) error {
@@ -394,4 +738,18 @@ func stripInitialRoomHistory(resp *mautrix.RespSync) {
 func stableTransactionID(kind, input string) string {
 	sum := sha256.Sum256([]byte(kind + ":" + input))
 	return fmt.Sprintf("onboarding_%s_%x", kind, sum[:8])
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxDuration(a, b time.Duration) time.Duration {
+	if a > b {
+		return a
+	}
+	return b
 }

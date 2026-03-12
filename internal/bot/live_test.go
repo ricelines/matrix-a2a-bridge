@@ -1,25 +1,28 @@
 package bot_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
-
-	botpkg "onboarding/internal/bot"
-	"onboarding/internal/config"
 
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
+
+	"onboarding/internal/agent"
+	botpkg "onboarding/internal/bot"
+	"onboarding/internal/config"
+	"onboarding/internal/state"
 )
 
 const (
@@ -32,49 +35,84 @@ const (
 	botPassword        = "bot-password"
 )
 
-func TestBotRepliesToLiveCommand(t *testing.T) {
+func TestBotStartsOnboardingOnFirstDirectInvite(t *testing.T) {
 	harness := newLiveHarness(t)
 	harness.startBot(t)
 
-	roomID := harness.createRoomAndInviteBot(t)
-	harness.alice.sendText(t, roomID, "!ping")
-	harness.alice.waitForMessage(t, roomID, harness.botUserID, "pong", 20*time.Second)
+	roomID := harness.createDirectRoomWithBot(t)
+	harness.alice.waitForMessage(t, roomID, harness.botUserID, "Welcome to Ricelines. I'll get you oriented. What should I call you?", 20*time.Second)
+
+	harness.alice.sendText(t, roomID, "Call me Alice")
+	harness.alice.waitForMessage(t, roomID, harness.botUserID, "What brings you to Ricelines today?", 20*time.Second)
+
+	harness.alice.sendText(t, roomID, "I'm here to explore")
+	harness.alice.waitForMessage(t, roomID, harness.botUserID, "Thanks. You're onboarded now, and you can keep chatting with me naturally whenever you need help.", 20*time.Second)
 }
 
-func TestBotReplaysMessagesAfterBotRestart(t *testing.T) {
+func TestBotOnboardsOnlyOnceAcrossRestart(t *testing.T) {
 	harness := newLiveHarness(t)
 	harness.startBot(t)
 
-	roomID := harness.createRoomAndInviteBot(t)
+	firstRoomID := harness.createDirectRoomWithBot(t)
+	harness.completeOnboarding(t, firstRoomID)
+
 	harness.stopBot(t)
-
-	harness.alice.sendText(t, roomID, "!echo first after restart")
-	harness.alice.sendText(t, roomID, "!echo second after restart")
-
 	harness.startBot(t)
 
-	harness.alice.waitForMessage(t, roomID, harness.botUserID, "first after restart", 25*time.Second)
-	harness.alice.waitForMessage(t, roomID, harness.botUserID, "second after restart", 25*time.Second)
+	secondRoomID := harness.createDirectRoomWithBot(t)
+	harness.alice.waitForNoMessageFrom(t, secondRoomID, harness.botUserID, 5*time.Second)
+
+	harness.alice.sendText(t, secondRoomID, "Can you show my status?")
+	harness.alice.waitForMessageContaining(t, secondRoomID, harness.botUserID, "Your onboarding record is set, and the action layer is still a stub.", 20*time.Second)
 }
 
-func TestBotRecoversAfterHomeserverRestart(t *testing.T) {
+func TestBotStartsNewTaskAfterIdleTimeout(t *testing.T) {
 	harness := newLiveHarness(t)
 	harness.startBot(t)
 
-	roomID := harness.createRoomAndInviteBot(t)
-	harness.server.restart(t)
+	roomID := harness.createDirectRoomWithBot(t)
+	harness.completeOnboarding(t, roomID)
 
-	harness.alice.sendText(t, roomID, "!echo after homeserver restart")
-	harness.alice.waitForMessage(t, roomID, harness.botUserID, "after homeserver restart", 30*time.Second)
+	harness.alice.sendText(t, roomID, "What can you do?")
+	harness.alice.waitForMessageContaining(t, roomID, harness.botUserID, "Stubbed actions available right now", 20*time.Second)
+
+	waitForCondition(t, 10*time.Second, func() bool {
+		return harness.agent.TaskCountForRoom(roomID.String()) == 2
+	}, "first post-onboarding task was not created")
+
+	taskIDs := harness.agent.TaskIDsForRoom(roomID.String())
+	if len(taskIDs) != 2 {
+		t.Fatalf("unexpected task IDs after first post-onboarding message: %v", taskIDs)
+	}
+	firstGeneralTaskID := taskIDs[1]
+
+	waitForCondition(t, harness.sessionIdleTimeout+5*time.Second, func() bool {
+		return harness.agent.WasTaskCanceled(firstGeneralTaskID)
+	}, "idle session task was not canceled")
+
+	harness.alice.sendText(t, roomID, "status please")
+	harness.alice.waitForMessageContaining(t, roomID, harness.botUserID, "Your onboarding record is set, and the action layer is still a stub.", 20*time.Second)
+
+	waitForCondition(t, 10*time.Second, func() bool {
+		return harness.agent.TaskCountForRoom(roomID.String()) == 3
+	}, "second post-idle task was not created")
+
+	if got := harness.agent.ContextCountForUser(harness.aliceUserID.String()); got != 1 {
+		t.Fatalf("ContextCountForUser() = %d, want 1 shared context", got)
+	}
 }
 
 type liveHarness struct {
-	t         *testing.T
-	server    *tuwunelContainer
-	alice     *syncingClient
-	botRun    *runningBot
-	statePath string
-	botUserID id.UserID
+	t                  *testing.T
+	server             *tuwunelContainer
+	agent              *agent.MockServer
+	alice              *syncingClient
+	botRun             *runningBot
+	botLog             *bytes.Buffer
+	statePath          string
+	botUserID          id.UserID
+	aliceUserID        id.UserID
+	sessionIdleTimeout time.Duration
 }
 
 func newLiveHarness(t *testing.T) *liveHarness {
@@ -82,14 +120,21 @@ func newLiveHarness(t *testing.T) *liveHarness {
 	requireDocker(t)
 
 	server := newTuwunelContainer(t)
+	agentServer := agent.StartMockServer()
 	alice := newSyncingClient(t, server.baseURL(), aliceUser, alicePassword)
 
+	t.Cleanup(agentServer.Close)
+
 	return &liveHarness{
-		t:         t,
-		server:    server,
-		alice:     alice,
-		statePath: filepath.Join(server.tempDir, "bot-state.json"),
-		botUserID: id.UserID(fmt.Sprintf("@%s:%s", botUser, serverName)),
+		t:                  t,
+		server:             server,
+		agent:              agentServer,
+		alice:              alice,
+		botLog:             &bytes.Buffer{},
+		statePath:          filepath.Join(server.tempDir, "bot-state.json"),
+		botUserID:          id.UserID(fmt.Sprintf("@%s:%s", botUser, serverName)),
+		aliceUserID:        id.UserID(fmt.Sprintf("@%s:%s", aliceUser, serverName)),
+		sessionIdleTimeout: 2 * time.Second,
 	}
 }
 
@@ -100,14 +145,15 @@ func (h *liveHarness) startBot(t *testing.T) {
 	}
 
 	cfg := config.Config{
-		HomeserverURL:   h.server.baseURL(),
-		Username:        botUser,
-		Password:        botPassword,
-		CommandPrefix:   "!",
-		AutoJoinInvites: true,
-		StatePath:       h.statePath,
+		HomeserverURL:      h.server.baseURL(),
+		Username:           botUser,
+		Password:           botPassword,
+		AutoJoinInvites:    true,
+		StatePath:          h.statePath,
+		A2AAgentURL:        h.agent.BaseURL(),
+		SessionIdleTimeout: h.sessionIdleTimeout,
 	}
-	matrixBot, err := botpkg.New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	matrixBot, err := botpkg.New(cfg, slog.New(slog.NewTextHandler(h.botLog, nil)))
 	if err != nil {
 		t.Fatalf("bot.New() error = %v", err)
 	}
@@ -128,6 +174,20 @@ func (h *liveHarness) startBot(t *testing.T) {
 			h.stopBot(t)
 		}
 	})
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("bot logs:\n%s", h.botLog.String())
+		}
+	})
+
+	waitForCondition(t, 20*time.Second, func() bool {
+		store, err := state.Open(h.statePath)
+		if err != nil {
+			return false
+		}
+		snapshot := store.Snapshot()
+		return snapshot.Session.UserID == h.botUserID.String() && snapshot.Sync.NextBatch != ""
+	}, "bot did not finish initial sync")
 }
 
 func (h *liveHarness) stopBot(t *testing.T) {
@@ -148,10 +208,12 @@ func (h *liveHarness) stopBot(t *testing.T) {
 	h.botRun = nil
 }
 
-func (h *liveHarness) createRoomAndInviteBot(t *testing.T) id.RoomID {
+func (h *liveHarness) createDirectRoomWithBot(t *testing.T) id.RoomID {
 	t.Helper()
+
 	room, err := h.alice.client.CreateRoom(context.Background(), &mautrix.ReqCreateRoom{
-		Preset: "private_chat",
+		Preset:   "private_chat",
+		IsDirect: true,
 	})
 	if err != nil {
 		t.Fatalf("CreateRoom() error = %v", err)
@@ -165,6 +227,16 @@ func (h *liveHarness) createRoomAndInviteBot(t *testing.T) id.RoomID {
 
 	h.alice.waitForMembership(t, room.RoomID, h.botUserID, event.MembershipJoin, 20*time.Second)
 	return room.RoomID
+}
+
+func (h *liveHarness) completeOnboarding(t *testing.T, roomID id.RoomID) {
+	t.Helper()
+
+	h.alice.waitForMessage(t, roomID, h.botUserID, "Welcome to Ricelines. I'll get you oriented. What should I call you?", 20*time.Second)
+	h.alice.sendText(t, roomID, "Alice")
+	h.alice.waitForMessage(t, roomID, h.botUserID, "What brings you to Ricelines today?", 20*time.Second)
+	h.alice.sendText(t, roomID, "I want to learn the system")
+	h.alice.waitForMessage(t, roomID, h.botUserID, "Thanks. You're onboarded now, and you can keep chatting with me naturally whenever you need help.", 20*time.Second)
 }
 
 type runningBot struct {
@@ -242,12 +314,6 @@ func (c *tuwunelContainer) stop(t *testing.T) {
 	}
 
 	_, _ = runCommand(30*time.Second, "docker", "stop", "-t", "1", c.name)
-}
-
-func (c *tuwunelContainer) restart(t *testing.T) {
-	t.Helper()
-	c.stop(t)
-	c.start(t)
 }
 
 func (c *tuwunelContainer) waitReady(t *testing.T) {
@@ -415,6 +481,51 @@ func (c *syncingClient) waitForMessage(t *testing.T, roomID id.RoomID, sender id
 	}
 }
 
+func (c *syncingClient) waitForMessageContaining(t *testing.T, roomID id.RoomID, sender id.UserID, wantSubstring string, timeout time.Duration) *event.Event {
+	t.Helper()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	for {
+		select {
+		case evt := <-c.messageEvents:
+			if evt.RoomID != roomID || evt.Sender != sender {
+				continue
+			}
+			if !strings.Contains(evt.Content.AsMessage().Body, wantSubstring) {
+				continue
+			}
+			return evt
+		case err := <-c.done:
+			t.Fatalf("sync client exited while waiting for message containing %q: %v", wantSubstring, err)
+		case <-timer.C:
+			t.Fatalf("timed out waiting for message containing %q from %s in room %s", wantSubstring, sender, roomID)
+		}
+	}
+}
+
+func (c *syncingClient) waitForNoMessageFrom(t *testing.T, roomID id.RoomID, sender id.UserID, timeout time.Duration) {
+	t.Helper()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	for {
+		select {
+		case evt := <-c.messageEvents:
+			if evt.RoomID != roomID || evt.Sender != sender {
+				continue
+			}
+			t.Fatalf("unexpected message from %s in room %s: %q", sender, roomID, evt.Content.AsMessage().Body)
+		case err := <-c.done:
+			t.Fatalf("sync client exited while waiting for silence: %v", err)
+		case <-timer.C:
+			return
+		}
+	}
+}
+
 func requireDocker(t *testing.T) {
 	t.Helper()
 	if testing.Short() {
@@ -463,4 +574,17 @@ func runCommand(timeout time.Duration, name string, args ...string) (string, err
 		return string(output), ctx.Err()
 	}
 	return string(output), err
+}
+
+func waitForCondition(t *testing.T, timeout time.Duration, condition func() bool, message string) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal(message)
 }

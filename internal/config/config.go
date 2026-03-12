@@ -2,33 +2,37 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"strings"
+	"time"
 )
 
 const (
-	defaultCommandPrefix = "!"
-	defaultStatePath     = "data/state.json"
+	defaultStatePath          = "data/state.json"
+	defaultSessionIdleTimeout = 10 * time.Minute
 
-	envHomeserverURL = "MATRIX_HOMESERVER_URL"
-	envUserID        = "MATRIX_USER_ID"
-	envAccessToken   = "MATRIX_ACCESS_TOKEN"
-	envUsername      = "MATRIX_USERNAME"
-	envPassword      = "MATRIX_PASSWORD"
-	envCommandPrefix = "MATRIX_COMMAND_PREFIX"
-	envAutoJoin      = "MATRIX_AUTO_JOIN_INVITES"
-	envStatePath     = "MATRIX_STATE_PATH"
+	envHomeserverURL      = "MATRIX_HOMESERVER_URL"
+	envUserID             = "MATRIX_USER_ID"
+	envAccessToken        = "MATRIX_ACCESS_TOKEN"
+	envUsername           = "MATRIX_USERNAME"
+	envPassword           = "MATRIX_PASSWORD"
+	envAutoJoin           = "MATRIX_AUTO_JOIN_INVITES"
+	envStatePath          = "MATRIX_STATE_PATH"
+	envA2AAgentURL        = "A2A_AGENT_URL"
+	envSessionIdleTimeout = "BOT_SESSION_IDLE_TIMEOUT"
 )
 
 type Config struct {
-	HomeserverURL   string
-	UserID          string
-	AccessToken     string
-	Username        string
-	Password        string
-	CommandPrefix   string
-	AutoJoinInvites bool
-	StatePath       string
+	HomeserverURL      string
+	UserID             string
+	AccessToken        string
+	Username           string
+	Password           string
+	AutoJoinInvites    bool
+	StatePath          string
+	A2AAgentURL        string
+	SessionIdleTimeout time.Duration
 }
 
 func FromEnv() (Config, error) {
@@ -38,16 +42,20 @@ func FromEnv() (Config, error) {
 		AccessToken:     strings.TrimSpace(os.Getenv(envAccessToken)),
 		Username:        strings.TrimSpace(os.Getenv(envUsername)),
 		Password:        strings.TrimSpace(os.Getenv(envPassword)),
-		CommandPrefix:   strings.TrimSpace(os.Getenv(envCommandPrefix)),
 		AutoJoinInvites: readBoolEnv(envAutoJoin, true),
 		StatePath:       strings.TrimSpace(os.Getenv(envStatePath)),
-	}
-	if cfg.CommandPrefix == "" {
-		cfg.CommandPrefix = defaultCommandPrefix
+		A2AAgentURL:     strings.TrimSpace(os.Getenv(envA2AAgentURL)),
 	}
 	if cfg.StatePath == "" {
 		cfg.StatePath = defaultStatePath
 	}
+
+	idleTimeout, err := readDurationEnv(envSessionIdleTimeout, defaultSessionIdleTimeout)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.SessionIdleTimeout = idleTimeout
+
 	return cfg, cfg.Validate()
 }
 
@@ -57,11 +65,14 @@ func (c Config) Validate() error {
 	if c.HomeserverURL == "" {
 		problems = append(problems, envHomeserverURL+" is required")
 	}
-	if c.CommandPrefix == "" {
-		problems = append(problems, "command prefix must not be empty")
-	}
 	if c.StatePath == "" {
 		problems = append(problems, "state path must not be empty")
+	}
+	if c.A2AAgentURL == "" {
+		problems = append(problems, envA2AAgentURL+" is required")
+	}
+	if c.SessionIdleTimeout <= 0 {
+		problems = append(problems, envSessionIdleTimeout+" must be greater than zero")
 	}
 
 	hasAccessTokenAuth := c.UserID != "" && c.AccessToken != ""
@@ -99,4 +110,17 @@ func readBoolEnv(name string, fallback bool) bool {
 	default:
 		return fallback
 	}
+}
+
+func readDurationEnv(name string, fallback time.Duration) (time.Duration, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback, nil
+	}
+
+	value, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("parse %s: %w", name, err)
+	}
+	return value, nil
 }
