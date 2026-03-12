@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"encoding/gob"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -17,11 +16,6 @@ import (
 
 const mockAgentEndpointPath = "/rpc"
 
-func init() {
-	gob.Register(map[string]any{})
-	gob.Register([]map[string]any{})
-}
-
 type MockServer struct {
 	mu           sync.Mutex
 	server       *httptest.Server
@@ -31,11 +25,8 @@ type MockServer struct {
 }
 
 type responsePlan struct {
-	State              a2aproto.TaskState
-	Reply              string
-	Commands           []Command
-	CompleteOnboarding bool
-	CloseSession       bool
+	State a2aproto.TaskState
+	Reply string
 }
 
 func StartMockServer() *MockServer {
@@ -99,7 +90,7 @@ func (m *MockServer) WasTaskCanceled(taskID string) bool {
 func (m *MockServer) agentCard() *a2aproto.AgentCard {
 	return &a2aproto.AgentCard{
 		Name:               "Mock Ricelines A2A Agent",
-		Description:        "Mock onboarding and intent parser used by the Matrix onboarding bot tests.",
+		Description:        "Mock onboarding agent used by the Matrix onboarding bot tests.",
 		Version:            "test",
 		URL:                m.server.URL + mockAgentEndpointPath,
 		ProtocolVersion:    string(a2aproto.Version),
@@ -168,11 +159,7 @@ func (e *mockExecutor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContex
 func (e *mockExecutor) Cancel(ctx context.Context, reqCtx *a2asrv.RequestContext, queue eventqueue.Queue) error {
 	e.mock.recordCancel(string(reqCtx.TaskID))
 
-	msg := buildAgentMessage(
-		reqCtx,
-		"I'll close this session here. Message me again when you're ready to continue.",
-		controlPayload{CloseSession: true},
-	)
+	msg := buildAgentMessage(reqCtx, "I'll close this session here. Message me again when you're ready to continue.")
 	update := a2aproto.NewStatusUpdateEvent(reqCtx, a2aproto.TaskStateCanceled, msg)
 	update.Final = true
 
@@ -185,28 +172,30 @@ func (e *mockExecutor) Cancel(ctx context.Context, reqCtx *a2asrv.RequestContext
 func buildPlan(reqCtx *a2asrv.RequestContext) responsePlan {
 	mode, _ := workflowMetadata(reqCtx.Metadata)
 	text := strings.TrimSpace(currentUserText(reqCtx.Message))
-	command, hasCommand := parseCommand(text)
+	intent, hasIntent := parseIntent(text)
 
 	if mode == "onboarding" {
-		return onboardingPlan(reqCtx, command, hasCommand)
+		return onboardingPlan(reqCtx, intent, hasIntent)
 	}
-	return generalPlan(command, hasCommand)
+	return generalPlan(intent, hasIntent)
 }
 
-func onboardingPlan(reqCtx *a2asrv.RequestContext, command Command, hasCommand bool) responsePlan {
+func onboardingPlan(reqCtx *a2asrv.RequestContext, intent string, hasIntent bool) responsePlan {
 	_, trigger := workflowMetadata(reqCtx.Metadata)
-	if hasCommand && command.Name == "close_session" {
+	if hasIntent && intent == "close_session" {
 		return responsePlan{
-			State:        a2aproto.TaskStateCompleted,
-			Reply:        "No problem. We can pick up onboarding again the next time you message me.",
-			CloseSession: true,
+			State: a2aproto.TaskStateCompleted,
+			Reply: "No problem. We can pick up onboarding again the next time you message me.",
 		}
 	}
-	if hasCommand {
+	if hasIntent {
+		reply := "We’re still onboarding. Answer the next question and I’ll stay available for follow-up requests after that."
+		if intent == "status" {
+			reply = "You're still in onboarding. Once we finish, I'll keep helping in this DM."
+		}
 		return responsePlan{
 			State:    a2aproto.TaskStateInputRequired,
-			Reply:    "I can answer that while we finish onboarding. Once we're done, I'll stay available for follow-up requests.",
-			Commands: []Command{command},
+			Reply:    reply,
 		}
 	}
 
@@ -231,69 +220,46 @@ func onboardingPlan(reqCtx *a2asrv.RequestContext, command Command, hasCommand b
 		}
 	default:
 		return responsePlan{
-			State:              a2aproto.TaskStateCompleted,
-			Reply:              "Thanks. You're onboarded now, and you can keep chatting with me naturally whenever you need help.",
-			CompleteOnboarding: true,
+			State: a2aproto.TaskStateCompleted,
+			Reply: "Thanks. You're onboarded now, and you can keep chatting with me naturally whenever you need help.",
 		}
 	}
 }
 
-func generalPlan(command Command, hasCommand bool) responsePlan {
-	if hasCommand && command.Name == "close_session" {
+func generalPlan(intent string, hasIntent bool) responsePlan {
+	if hasIntent && intent == "close_session" {
 		return responsePlan{
-			State:        a2aproto.TaskStateCompleted,
-			Reply:        "I'll wrap up this session now.",
-			Commands:     []Command{command},
-			CloseSession: true,
+			State: a2aproto.TaskStateCompleted,
+			Reply: "I'll wrap up this session now.",
 		}
 	}
-	if hasCommand {
-		reply := "I can help with that."
-		if command.Name == "status" {
-			reply = "I can check that."
+	if hasIntent {
+		reply := "I can keep this DM connected to an A2A task, preserve shared context, and continue the conversation naturally."
+		if intent == "status" {
+			reply = "Your onboarding record is set, and this conversation is using the shared A2A context."
 		}
 		return responsePlan{
 			State:    a2aproto.TaskStateInputRequired,
 			Reply:    reply,
-			Commands: []Command{command},
 		}
 	}
 
 	return responsePlan{
 		State: a2aproto.TaskStateInputRequired,
-		Reply: "I'm here, and the command-routing layer is wired up. The concrete actions are still stubs, so ask for help or status if you want to see what's connected.",
+		Reply: "I'm here and ready to continue the conversation over A2A. Ask for help or status if you want to inspect the mock flow.",
 	}
 }
 
 func buildStatusMessage(reqCtx *a2asrv.RequestContext, plan responsePlan) *a2aproto.Message {
-	return buildAgentMessage(reqCtx, plan.Reply, controlPayload{
-		Commands:           plan.Commands,
-		CompleteOnboarding: plan.CompleteOnboarding,
-		CloseSession:       plan.CloseSession,
-	})
+	return buildAgentMessage(reqCtx, plan.Reply)
 }
 
-func buildAgentMessage(reqCtx *a2asrv.RequestContext, reply string, payload controlPayload) *a2aproto.Message {
-	parts := make([]a2aproto.Part, 0, 2)
-	if len(payload.Commands) > 0 || payload.CompleteOnboarding || payload.CloseSession {
-		commands := make([]map[string]any, 0, len(payload.Commands))
-		for _, command := range payload.Commands {
-			commands = append(commands, map[string]any{
-				"name": command.Name,
-				"args": command.Args,
-			})
-		}
-		data := map[string]any{
-			"commands":            commands,
-			"complete_onboarding": payload.CompleteOnboarding,
-			"close_session":       payload.CloseSession,
-		}
-		parts = append(parts, a2aproto.DataPart{Data: data})
-	}
-	if reply != "" {
-		parts = append(parts, a2aproto.TextPart{Text: reply})
-	}
-	return a2aproto.NewMessageForTask(a2aproto.MessageRoleAgent, reqCtx, parts...)
+func buildAgentMessage(reqCtx *a2asrv.RequestContext, reply string) *a2aproto.Message {
+	return a2aproto.NewMessageForTask(
+		a2aproto.MessageRoleAgent,
+		reqCtx,
+		a2aproto.TextPart{Text: reply},
+	)
 }
 
 func currentUserText(msg *a2aproto.Message) string {
@@ -311,19 +277,19 @@ func currentUserText(msg *a2aproto.Message) string {
 	return ""
 }
 
-func parseCommand(text string) (Command, bool) {
+func parseIntent(text string) (string, bool) {
 	normalized := strings.ToLower(strings.TrimSpace(text))
 	switch {
 	case normalized == "":
-		return Command{}, false
+		return "", false
 	case strings.Contains(normalized, "status"):
-		return Command{Name: "status"}, true
+		return "status", true
 	case strings.Contains(normalized, "help"), strings.Contains(normalized, "what can you do"):
-		return Command{Name: "help"}, true
+		return "help", true
 	case strings.Contains(normalized, "close"), strings.Contains(normalized, "done for now"):
-		return Command{Name: "close_session"}, true
+		return "close_session", true
 	default:
-		return Command{}, false
+		return "", false
 	}
 }
 

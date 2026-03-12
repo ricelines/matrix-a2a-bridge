@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	a2aproto "github.com/a2aproject/a2a-go/a2a"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
@@ -277,7 +278,7 @@ func (b *Bot) handleMessageEvent(ctx context.Context, evt *event.Event) {
 		return
 	}
 
-	replyBody := b.renderReply(record, reply)
+	replyBody := b.renderReply(reply)
 	if replyBody == "" {
 		replyBody = "I'm still here, but I didn't get a usable reply from the agent endpoint."
 	}
@@ -304,20 +305,8 @@ func (b *Bot) handleMessageEvent(ctx context.Context, evt *event.Event) {
 	_ = b.markHandledEvent(evt.ID.String(), "message")
 }
 
-func (b *Bot) renderReply(record userRecord, reply agent.Response) string {
-	var parts []string
-	if text := strings.TrimSpace(reply.Reply); text != "" {
-		parts = append(parts, text)
-	}
-
-	effectiveOnboarded := record.Onboarded() || reply.CompleteOnboarding
-	for _, command := range reply.Commands {
-		if stub := renderCommandStub(command, effectiveOnboarded); stub != "" {
-			parts = append(parts, stub)
-		}
-	}
-
-	return strings.TrimSpace(strings.Join(parts, "\n\n"))
+func (b *Bot) renderReply(reply agent.Response) string {
+	return strings.TrimSpace(reply.Reply)
 }
 
 func (b *Bot) startOnboardingIfNeeded(ctx context.Context, roomID id.RoomID, hintedUserID id.UserID, sourceEventID string, requireFreshContext bool) {
@@ -382,7 +371,7 @@ func (b *Bot) startOnboardingIfNeeded(ctx context.Context, roomID id.RoomID, hin
 		return
 	}
 
-	body := b.renderReply(record, reply)
+	body := b.renderReply(reply)
 	if body == "" {
 		body = "Welcome. I'm ready to get you onboarded."
 	}
@@ -406,22 +395,6 @@ func (b *Bot) startOnboardingIfNeeded(ctx context.Context, roomID id.RoomID, hin
 	_ = b.markHandledEvent(sourceEventID, "member")
 }
 
-func renderCommandStub(command agent.Command, onboarded bool) string {
-	switch command.Name {
-	case "help":
-		return "Stubbed actions available right now: I can explain the bot wiring, confirm your onboarding state, and keep the session lifecycle clean while the real actions are being built."
-	case "status":
-		if onboarded {
-			return "Your onboarding record is set, and the action layer is still a stub."
-		}
-		return "You're still in onboarding, and the action layer is still a stub."
-	case "close_session":
-		return ""
-	default:
-		return "I parsed a command, but the concrete action is still a stub."
-	}
-}
-
 func (b *Bot) persistReplyState(ctx context.Context, roomID id.RoomID, userID id.UserID, record userRecord, reply agent.Response, now time.Time) error {
 	updated := record
 	changed := false
@@ -430,7 +403,7 @@ func (b *Bot) persistReplyState(ctx context.Context, roomID id.RoomID, userID id
 		updated.ContextID = reply.ContextID
 		changed = true
 	}
-	if reply.CompleteOnboarding && !updated.Onboarded() {
+	if !updated.Onboarded() && conversationMode(record) == "onboarding" && reply.State == a2aproto.TaskStateCompleted {
 		timestamp := now
 		updated.OnboardedAt = &timestamp
 		changed = true
@@ -442,7 +415,7 @@ func (b *Bot) persistReplyState(ctx context.Context, roomID id.RoomID, userID id
 		}
 	}
 
-	if reply.CloseSession || reply.State.Terminal() || reply.TaskID == "" {
+	if reply.State.Terminal() || reply.TaskID == "" {
 		b.sessions.Remove(roomID)
 		return nil
 	}

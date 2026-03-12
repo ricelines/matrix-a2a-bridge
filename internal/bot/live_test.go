@@ -3,6 +3,7 @@ package bot_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -55,6 +56,7 @@ func TestBotOnboardsOnlyOnceAcrossRestart(t *testing.T) {
 
 	firstRoomID := harness.createDirectRoomWithBot(t)
 	harness.completeOnboarding(t, firstRoomID)
+	harness.waitForOnboardingRecord(t)
 
 	harness.stopBot(t)
 	harness.startBot(t)
@@ -63,7 +65,7 @@ func TestBotOnboardsOnlyOnceAcrossRestart(t *testing.T) {
 	harness.alice.waitForNoMessageFrom(t, secondRoomID, harness.botUserID, 5*time.Second)
 
 	harness.alice.sendText(t, secondRoomID, "Can you show my status?")
-	harness.alice.waitForMessageContaining(t, secondRoomID, harness.botUserID, "Your onboarding record is set, and the action layer is still a stub.", 20*time.Second)
+	harness.alice.waitForMessageContaining(t, secondRoomID, harness.botUserID, "Your onboarding record is set, and this conversation is using the shared A2A context.", 20*time.Second)
 }
 
 func TestBotStartsNewTaskAfterIdleTimeout(t *testing.T) {
@@ -74,7 +76,7 @@ func TestBotStartsNewTaskAfterIdleTimeout(t *testing.T) {
 	harness.completeOnboarding(t, roomID)
 
 	harness.alice.sendText(t, roomID, "What can you do?")
-	harness.alice.waitForMessageContaining(t, roomID, harness.botUserID, "Stubbed actions available right now", 20*time.Second)
+	harness.alice.waitForMessageContaining(t, roomID, harness.botUserID, "I can keep this DM connected to an A2A task, preserve shared context, and continue the conversation naturally.", 20*time.Second)
 
 	waitForCondition(t, 10*time.Second, func() bool {
 		return harness.agent.TaskCountForRoom(roomID.String()) == 2
@@ -91,7 +93,7 @@ func TestBotStartsNewTaskAfterIdleTimeout(t *testing.T) {
 	}, "idle session task was not canceled")
 
 	harness.alice.sendText(t, roomID, "status please")
-	harness.alice.waitForMessageContaining(t, roomID, harness.botUserID, "Your onboarding record is set, and the action layer is still a stub.", 20*time.Second)
+	harness.alice.waitForMessageContaining(t, roomID, harness.botUserID, "Your onboarding record is set, and this conversation is using the shared A2A context.", 20*time.Second)
 
 	waitForCondition(t, 10*time.Second, func() bool {
 		return harness.agent.TaskCountForRoom(roomID.String()) == 3
@@ -144,6 +146,13 @@ func (h *liveHarness) startBot(t *testing.T) {
 		t.Fatalf("bot already running")
 	}
 
+	waitForPasswordLogin(t, h.server.baseURL(), botUser, botPassword)
+	existingState, err := state.Open(h.statePath)
+	if err != nil {
+		t.Fatalf("state.Open() error = %v", err)
+	}
+	hadSyncCursor := existingState.Snapshot().Sync.NextBatch != ""
+
 	cfg := config.Config{
 		HomeserverURL:      h.server.baseURL(),
 		Username:           botUser,
@@ -188,6 +197,9 @@ func (h *liveHarness) startBot(t *testing.T) {
 		snapshot := store.Snapshot()
 		return snapshot.Session.UserID == h.botUserID.String() && snapshot.Sync.NextBatch != ""
 	}, "bot did not finish initial sync")
+	if hadSyncCursor {
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
 func (h *liveHarness) stopBot(t *testing.T) {
@@ -237,6 +249,28 @@ func (h *liveHarness) completeOnboarding(t *testing.T, roomID id.RoomID) {
 	h.alice.waitForMessage(t, roomID, h.botUserID, "What brings you to Ricelines today?", 20*time.Second)
 	h.alice.sendText(t, roomID, "I want to learn the system")
 	h.alice.waitForMessage(t, roomID, h.botUserID, "Thanks. You're onboarded now, and you can keep chatting with me naturally whenever you need help.", 20*time.Second)
+}
+
+func (h *liveHarness) waitForOnboardingRecord(t *testing.T) {
+	t.Helper()
+
+	client := newLoggedInClient(t, h.server.baseURL(), botUser, botPassword)
+	eventType := onboardingBucketEventType(h.aliceUserID)
+
+	waitForCondition(t, 10*time.Second, func() bool {
+		var bucket struct {
+			Users map[string]struct {
+				ContextID   string     `json:"context_id,omitempty"`
+				OnboardedAt *time.Time `json:"onboarded_at,omitempty"`
+			} `json:"users,omitempty"`
+		}
+		if err := client.GetAccountData(context.Background(), eventType, &bucket); err != nil {
+			return false
+		}
+
+		record, ok := bucket.Users[h.aliceUserID.String()]
+		return ok && record.OnboardedAt != nil && record.ContextID != ""
+	}, "bot did not persist onboarding record")
 }
 
 type runningBot struct {
@@ -359,32 +393,7 @@ type syncingClient struct {
 func newSyncingClient(t *testing.T, homeserverURL, username, password string) *syncingClient {
 	t.Helper()
 
-	client, err := mautrix.NewClient(homeserverURL, "", "")
-	if err != nil {
-		t.Fatalf("NewClient() error = %v", err)
-	}
-	client.DefaultHTTPRetries = 3
-	client.DefaultHTTPBackoff = 2 * time.Second
-
-	deadline := time.Now().Add(20 * time.Second)
-	for {
-		_, err = client.Login(context.Background(), &mautrix.ReqLogin{
-			Type: mautrix.AuthTypePassword,
-			Identifier: mautrix.UserIdentifier{
-				Type: mautrix.IdentifierTypeUser,
-				User: username,
-			},
-			Password:         password,
-			StoreCredentials: true,
-		})
-		if err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("Login() error = %v", err)
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
+	client := newLoggedInClient(t, homeserverURL, username, password)
 
 	sc := &syncingClient{
 		t:             t,
@@ -421,6 +430,50 @@ func newSyncingClient(t *testing.T, homeserverURL, username, password string) *s
 	})
 
 	return sc
+}
+
+func waitForPasswordLogin(t *testing.T, homeserverURL, username, password string) {
+	t.Helper()
+
+	_ = newLoggedInClient(t, homeserverURL, username, password)
+}
+
+func newLoggedInClient(t *testing.T, homeserverURL, username, password string) *mautrix.Client {
+	t.Helper()
+
+	client, err := mautrix.NewClient(homeserverURL, "", "")
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	client.DefaultHTTPRetries = 3
+	client.DefaultHTTPBackoff = 2 * time.Second
+
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		_, err = client.Login(context.Background(), &mautrix.ReqLogin{
+			Type: mautrix.AuthTypePassword,
+			Identifier: mautrix.UserIdentifier{
+				Type: mautrix.IdentifierTypeUser,
+				User: username,
+			},
+			Password:         password,
+			StoreCredentials: true,
+		})
+		if err == nil {
+			return client
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Login() error = %v", err)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	return client
+}
+
+func onboardingBucketEventType(userID id.UserID) string {
+	sum := sha256.Sum256([]byte(userID))
+	return fmt.Sprintf("com.ricelines.onboarding.users.%02x", sum[0])
 }
 
 func (c *syncingClient) sendText(t *testing.T, roomID id.RoomID, body string) {

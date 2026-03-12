@@ -1,6 +1,6 @@
 # Matrix Onboarding Bot
 
-This service is a Matrix DM onboarding bot written in Go. It accepts a user's first DM invite, starts a one-time onboarding flow in natural language, and keeps handling later natural-language requests by routing intent parsing through an external A2A HTTP agent.
+This service is a Matrix DM onboarding bot written in Go. It accepts a user's first DM invite, starts a one-time onboarding flow in natural language, and keeps handling later natural-language requests by forwarding each DM turn to an external A2A HTTP agent.
 
 ## Behavior
 
@@ -10,7 +10,7 @@ This service is a Matrix DM onboarding bot written in Go. It accepts a user's fi
 - persists only bot session state locally; per-user onboarding state and shared context live in Matrix account data so deployment does not require a separate database
 - keeps per-room A2A task sessions in memory and cancels them after inactivity
 - keeps talking to the user in normal text messages rather than slash-style commands
-- executes stub bot actions from structured A2A command payloads so the parsing layer is cleanly separated from the Matrix side
+- uses standard A2A messages, tasks, task states, and context IDs as its agent contract
 
 ## A2A Integration
 
@@ -26,8 +26,8 @@ For each DM turn it sends:
 The response is expected to contain:
 
 - a natural-language text reply
-- optional structured command data for bot-side stub actions
-- optional control flags such as onboarding completion or session closure
+- standard A2A task state and task/context identifiers when the conversation remains active
+- optional artifacts, with the bot falling back to the latest text artifact when the status message itself has no text
 
 `internal/agent/mock.go` provides the mock A2A system used by the live tests.
 

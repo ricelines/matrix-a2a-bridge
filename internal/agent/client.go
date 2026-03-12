@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -19,25 +18,11 @@ type Request struct {
 	Metadata  map[string]any
 }
 
-type Command struct {
-	Name string         `json:"name"`
-	Args map[string]any `json:"args,omitempty"`
-}
-
 type Response struct {
-	TaskID             string
-	ContextID          string
-	State              a2aproto.TaskState
-	Reply              string
-	Commands           []Command
-	CompleteOnboarding bool
-	CloseSession       bool
-}
-
-type controlPayload struct {
-	Commands           []Command `json:"commands,omitempty"`
-	CompleteOnboarding bool      `json:"complete_onboarding,omitempty"`
-	CloseSession       bool      `json:"close_session,omitempty"`
+	TaskID    string
+	ContextID string
+	State     a2aproto.TaskState
+	Reply     string
 }
 
 type Client struct {
@@ -212,14 +197,6 @@ func applyMessage(resp *Response, msg *a2aproto.Message) error {
 			if text != "" {
 				paragraphs = append(paragraphs, text)
 			}
-		case a2aproto.DataPart:
-			if err := applyControl(resp, value.Data); err != nil {
-				return err
-			}
-		case *a2aproto.DataPart:
-			if err := applyControl(resp, value.Data); err != nil {
-				return err
-			}
 		}
 	}
 
@@ -250,25 +227,4 @@ func applyArtifactFallback(resp *Response, artifacts []*a2aproto.Artifact) {
 		resp.Reply = strings.Join(paragraphs, "\n\n")
 		return
 	}
-}
-
-func applyControl(resp *Response, data map[string]any) error {
-	if len(data) == 0 {
-		return nil
-	}
-
-	payloadBytes, err := json.Marshal(data)
-	if err != nil {
-		return fmt.Errorf("marshal control payload: %w", err)
-	}
-
-	var payload controlPayload
-	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
-		return fmt.Errorf("decode control payload: %w", err)
-	}
-
-	resp.Commands = append(resp.Commands, payload.Commands...)
-	resp.CompleteOnboarding = resp.CompleteOnboarding || payload.CompleteOnboarding
-	resp.CloseSession = resp.CloseSession || payload.CloseSession
-	return nil
 }
