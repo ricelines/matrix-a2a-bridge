@@ -1,0 +1,51 @@
+{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      matrix_username: { type: "string" },
+      matrix_password: { type: "string", secret: true },
+      // How long an inactive A2A-backed chat session stays alive before the bot
+      // cancels it and starts a new task on the next user message. Set this as a
+      // Go duration string such as "30s", "10m", or "1h".
+      bot_session_idle_timeout: { type: "string" },
+    },
+    additionalProperties: false,
+  },
+  resources: {
+    state: {
+      kind: "storage",
+      params: {
+        size: "64Mi",
+      },
+    },
+  },
+  program: {
+    image: "ghcr.io/ricelines/onboarding-agent",
+    entrypoint: ["/app/matrix-bot"],
+    env: {
+      MATRIX_HOMESERVER_URL: "${slots.matrix.url}",
+      A2A_AGENT_URL: "${slots.agent.url}",
+      MATRIX_STATE_PATH: "/app/data/state.json",
+      MATRIX_USERNAME: {
+        when: "config.matrix_username",
+        value: "${config.matrix_username}",
+      },
+      MATRIX_PASSWORD: {
+        when: "config.matrix_password",
+        value: "${config.matrix_password}",
+      },
+      BOT_SESSION_IDLE_TIMEOUT: {
+        when: "config.bot_session_idle_timeout",
+        value: "${config.bot_session_idle_timeout}",
+      },
+    },
+    mounts: [
+      { path: "/app/data", from: "resources.state" },
+    ],
+  },
+  slots: {
+    matrix: { kind: "http" },
+    agent: { kind: "a2a" },
+  },
+}

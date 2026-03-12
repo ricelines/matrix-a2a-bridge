@@ -1,0 +1,21 @@
+{
+  manifest_version: "0.1.0",
+  slots: {
+    matrix: { kind: "http" },
+  },
+  components: {
+    agent: "./mock-a2a.json5",
+    bot: {
+      manifest: "./onboarding-agent.json5",
+      config: {
+        matrix_username: "bot",
+        matrix_password: "bot-password",
+        bot_session_idle_timeout: "2s",
+      },
+    },
+  },
+  bindings: [
+    { to: "#bot.matrix", from: "self.matrix", weak: true },
+    { to: "#bot.agent", from: "#agent.agent" },
+  ],
+}

@@ -4,9 +4,9 @@ This service is a Matrix DM onboarding bot written in Go. It accepts a user's fi
 
 ## Behavior
 
-- logs in to a Matrix homeserver with either password auth or an access token
+- logs in to a Matrix homeserver with password auth, then persists the resulting session locally for restart and recovery
 - runs a replay-safe `/sync` loop and keeps deterministic Matrix transaction IDs for bot replies
-- accepts DM invites and opens onboarding automatically the first time a user brings the bot into a direct chat
+- joins DM invites automatically and opens onboarding the first time a user brings the bot into a direct chat
 - persists only bot session state locally; per-user onboarding state and shared context live in Matrix account data so deployment does not require a separate database
 - keeps per-room A2A task sessions in memory and cancels them after inactivity
 - keeps talking to the user in normal text messages rather than slash-style commands
@@ -37,17 +37,16 @@ Required:
 
 - `MATRIX_HOMESERVER_URL`
 - `A2A_AGENT_URL`
-- one auth pair:
-  - `MATRIX_USER_ID` and `MATRIX_ACCESS_TOKEN`
-  - `MATRIX_USERNAME` and `MATRIX_PASSWORD`
+- `MATRIX_USERNAME`
+- `MATRIX_PASSWORD`
 
 Optional:
 
-- `MATRIX_AUTO_JOIN_INVITES` defaults to `true`
 - `MATRIX_STATE_PATH` defaults to `data/state.json`
 - `BOT_SESSION_IDLE_TIMEOUT` defaults to `10m`
 
 `MATRIX_USERNAME` can be either a localpart such as `bot` or a full Matrix user ID such as `@bot:example.com`.
+On first start the bot logs in with the configured password, then persists the returned Matrix access token and device ID in its local state. Subsequent restarts reuse that stored session and only fall back to password login if the stored token is missing or no longer valid.
 
 ## Persistence
 

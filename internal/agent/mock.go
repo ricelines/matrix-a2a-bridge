@@ -30,20 +30,33 @@ type responsePlan struct {
 }
 
 func StartMockServer() *MockServer {
+	mock := newMockServer()
+	server := httptest.NewServer(newMockHandler(mock))
+	mock.server = server
+
+	return mock
+}
+
+func NewMockHTTPHandler() http.Handler {
+	return newMockHandler(newMockServer())
+}
+
+func newMockServer() *MockServer {
 	mock := &MockServer{
 		roomTaskIDs:  make(map[string][]string),
 		userContexts: make(map[string]map[string]struct{}),
 	}
+	return mock
+}
 
+func newMockHandler(mock *MockServer) http.Handler {
 	reqHandler := a2asrv.NewHandler(&mockExecutor{mock: mock})
 	mux := http.NewServeMux()
-	server := httptest.NewServer(mux)
-	mock.server = server
-
-	mux.Handle(a2asrv.WellKnownAgentCardPath, a2asrv.NewStaticAgentCardHandler(mock.agentCard()))
+	mux.HandleFunc(a2asrv.WellKnownAgentCardPath, func(w http.ResponseWriter, r *http.Request) {
+		a2asrv.NewStaticAgentCardHandler(mock.agentCard(requestBaseURL(r))).ServeHTTP(w, r)
+	})
 	mux.Handle(mockAgentEndpointPath, a2asrv.NewJSONRPCHandler(reqHandler))
-
-	return mock
+	return mux
 }
 
 func (m *MockServer) Close() {
@@ -87,12 +100,12 @@ func (m *MockServer) WasTaskCanceled(taskID string) bool {
 	return slices.Contains(m.canceled, taskID)
 }
 
-func (m *MockServer) agentCard() *a2aproto.AgentCard {
+func (m *MockServer) agentCard(baseURL string) *a2aproto.AgentCard {
 	return &a2aproto.AgentCard{
 		Name:               "Mock Ricelines A2A Agent",
 		Description:        "Mock onboarding agent used by the Matrix onboarding bot tests.",
 		Version:            "test",
-		URL:                m.server.URL + mockAgentEndpointPath,
+		URL:                baseURL + mockAgentEndpointPath,
 		ProtocolVersion:    string(a2aproto.Version),
 		PreferredTransport: a2aproto.TransportProtocolJSONRPC,
 		Capabilities: a2aproto.AgentCapabilities{
@@ -103,11 +116,19 @@ func (m *MockServer) agentCard() *a2aproto.AgentCard {
 		AdditionalInterfaces: []a2aproto.AgentInterface{
 			{
 				Transport: a2aproto.TransportProtocolJSONRPC,
-				URL:       m.server.URL + mockAgentEndpointPath,
+				URL:       baseURL + mockAgentEndpointPath,
 			},
 		},
 		Skills: []a2aproto.AgentSkill{},
 	}
+}
+
+func requestBaseURL(r *http.Request) string {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	return scheme + "://" + r.Host
 }
 
 func (m *MockServer) recordExecution(reqCtx *a2asrv.RequestContext) {
@@ -194,8 +215,8 @@ func onboardingPlan(reqCtx *a2asrv.RequestContext, intent string, hasIntent bool
 			reply = "You're still in onboarding. Once we finish, I'll keep helping in this DM."
 		}
 		return responsePlan{
-			State:    a2aproto.TaskStateInputRequired,
-			Reply:    reply,
+			State: a2aproto.TaskStateInputRequired,
+			Reply: reply,
 		}
 	}
 
@@ -239,8 +260,8 @@ func generalPlan(intent string, hasIntent bool) responsePlan {
 			reply = "Your onboarding record is set, and this conversation is using the shared A2A context."
 		}
 		return responsePlan{
-			State:    a2aproto.TaskStateInputRequired,
-			Reply:    reply,
+			State: a2aproto.TaskStateInputRequired,
+			Reply: reply,
 		}
 	}
 

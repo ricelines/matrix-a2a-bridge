@@ -28,6 +28,12 @@ RUN --mount=type=cache,target=/go/pkg/mod,sharing=locked \
         -ldflags='-s -w' \
         -o /out/matrix-bot \
         ./cmd/matrix-bot && \
+    go build \
+        -buildvcs=false \
+        -trimpath \
+        -ldflags='-s -w' \
+        -o /out/mock-a2a \
+        ./cmd/mock-a2a && \
     mkdir -p /out/data
 
 FROM gcr.io/distroless/static-debian13:nonroot
@@ -35,6 +41,7 @@ FROM gcr.io/distroless/static-debian13:nonroot
 WORKDIR /app
 
 COPY --from=build --chown=nonroot:nonroot /out/matrix-bot /app/matrix-bot
+COPY --from=build --chown=nonroot:nonroot /out/mock-a2a /app/mock-a2a
 COPY --from=build --chown=nonroot:nonroot /out/data /app/data
 
 ENTRYPOINT ["/app/matrix-bot"]

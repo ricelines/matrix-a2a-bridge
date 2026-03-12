@@ -176,9 +176,6 @@ func (b *Bot) handleMemberEvent(ctx context.Context, evt *event.Event) {
 	member := evt.Content.AsMember()
 	switch member.Membership {
 	case event.MembershipInvite:
-		if !b.config.AutoJoinInvites {
-			return
-		}
 		if _, err := b.client.JoinRoomByID(ctx, evt.RoomID); err != nil {
 			b.log.Error("failed to join invited room",
 				"room_id", evt.RoomID.String(),
@@ -652,23 +649,6 @@ func (b *Bot) canRelogin() bool {
 }
 
 func resolveInitialSession(cfg config.Config, snapshot state.FileState) (state.Session, error) {
-	if cfg.UsingAccessToken() {
-		userID := id.UserID(cfg.UserID)
-		if _, _, err := userID.ParseAndValidateRelaxed(); err != nil {
-			return state.Session{}, fmt.Errorf("parse %s: %w", "MATRIX_USER_ID", err)
-		}
-
-		session := state.Session{
-			HomeserverURL: cfg.HomeserverURL,
-			UserID:        cfg.UserID,
-			AccessToken:   cfg.AccessToken,
-		}
-		if snapshot.Session.HomeserverURL == cfg.HomeserverURL && snapshot.Session.UserID == cfg.UserID {
-			session.DeviceID = snapshot.Session.DeviceID
-		}
-		return session, nil
-	}
-
 	if snapshot.Session.HomeserverURL == cfg.HomeserverURL &&
 		snapshot.Session.UserID != "" &&
 		snapshot.Session.AccessToken != "" &&

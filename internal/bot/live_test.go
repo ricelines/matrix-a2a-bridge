@@ -157,7 +157,6 @@ func (h *liveHarness) startBot(t *testing.T) {
 		HomeserverURL:      h.server.baseURL(),
 		Username:           botUser,
 		Password:           botPassword,
-		AutoJoinInvites:    true,
 		StatePath:          h.statePath,
 		A2AAgentURL:        h.agent.BaseURL(),
 		SessionIdleTimeout: h.sessionIdleTimeout,
