@@ -202,7 +202,13 @@ func buildPlan(reqCtx *a2asrv.RequestContext) responsePlan {
 }
 
 func onboardingPlan(reqCtx *a2asrv.RequestContext, intent string, hasIntent bool) responsePlan {
-	_, trigger := workflowMetadata(reqCtx.Metadata)
+	if reqCtx.StoredTask == nil {
+		return responsePlan{
+			State: a2aproto.TaskStateInputRequired,
+			Reply: "Welcome to Ricelines. I'll get you oriented. What should I call you?",
+		}
+	}
+
 	if hasIntent && intent == "close_session" {
 		return responsePlan{
 			State: a2aproto.TaskStateCompleted,
@@ -217,19 +223,6 @@ func onboardingPlan(reqCtx *a2asrv.RequestContext, intent string, hasIntent bool
 		return responsePlan{
 			State: a2aproto.TaskStateInputRequired,
 			Reply: reply,
-		}
-	}
-
-	if reqCtx.StoredTask == nil {
-		if trigger == "invite" {
-			return responsePlan{
-				State: a2aproto.TaskStateInputRequired,
-				Reply: "Welcome to Ricelines. I'll get you oriented. What should I call you?",
-			}
-		}
-		return responsePlan{
-			State: a2aproto.TaskStateInputRequired,
-			Reply: "Welcome to Ricelines. Before we get started, what should I call you?",
 		}
 	}
 

@@ -34,13 +34,17 @@ const (
 	alicePassword      = "alice-password"
 	botUser            = "bot"
 	botPassword        = "bot-password"
+	liveEnvVar         = "ONBOARDING_RUN_LIVE"
 )
 
-func TestBotStartsOnboardingOnFirstDirectInvite(t *testing.T) {
+func TestBotStartsOnboardingOnFirstDirectMessage(t *testing.T) {
 	harness := newLiveHarness(t)
 	harness.startBot(t)
 
 	roomID := harness.createDirectRoomWithBot(t)
+	harness.alice.waitForNoMessageFrom(t, roomID, harness.botUserID, 5*time.Second)
+
+	harness.alice.sendText(t, roomID, "Hi")
 	harness.alice.waitForMessage(t, roomID, harness.botUserID, "Welcome to Ricelines. I'll get you oriented. What should I call you?", 20*time.Second)
 
 	harness.alice.sendText(t, roomID, "Call me Alice")
@@ -119,6 +123,7 @@ type liveHarness struct {
 
 func newLiveHarness(t *testing.T) *liveHarness {
 	t.Helper()
+	requireLiveBotTests(t)
 	requireDocker(t)
 
 	server := newTuwunelContainer(t)
@@ -147,12 +152,9 @@ func (h *liveHarness) startBot(t *testing.T) {
 	}
 
 	waitForPasswordLogin(t, h.server.baseURL(), botUser, botPassword)
-	existingState, err := state.Open(h.statePath)
-	if err != nil {
+	if _, err := state.Open(h.statePath); err != nil {
 		t.Fatalf("state.Open() error = %v", err)
 	}
-	hadSyncCursor := existingState.Snapshot().Sync.NextBatch != ""
-
 	cfg := config.Config{
 		HomeserverURL:      h.server.baseURL(),
 		Username:           botUser,
@@ -196,9 +198,7 @@ func (h *liveHarness) startBot(t *testing.T) {
 		snapshot := store.Snapshot()
 		return snapshot.Session.UserID == h.botUserID.String() && snapshot.Sync.NextBatch != ""
 	}, "bot did not finish initial sync")
-	if hadSyncCursor {
-		time.Sleep(500 * time.Millisecond)
-	}
+	time.Sleep(500 * time.Millisecond)
 }
 
 func (h *liveHarness) stopBot(t *testing.T) {
@@ -236,13 +236,14 @@ func (h *liveHarness) createDirectRoomWithBot(t *testing.T) id.RoomID {
 		t.Fatalf("InviteUser() error = %v", err)
 	}
 
-	h.alice.waitForMembership(t, room.RoomID, h.botUserID, event.MembershipJoin, 20*time.Second)
+	waitForJoinedMember(t, h.alice.client, room.RoomID, h.botUserID, 20*time.Second)
 	return room.RoomID
 }
 
 func (h *liveHarness) completeOnboarding(t *testing.T, roomID id.RoomID) {
 	t.Helper()
 
+	h.alice.sendText(t, roomID, "Hi")
 	h.alice.waitForMessage(t, roomID, h.botUserID, "Welcome to Ricelines. I'll get you oriented. What should I call you?", 20*time.Second)
 	h.alice.sendText(t, roomID, "Alice")
 	h.alice.waitForMessage(t, roomID, h.botUserID, "What brings you to Ricelines today?", 20*time.Second)
@@ -482,31 +483,20 @@ func (c *syncingClient) sendText(t *testing.T, roomID id.RoomID, body string) {
 	}
 }
 
-func (c *syncingClient) waitForMembership(t *testing.T, roomID id.RoomID, userID id.UserID, membership event.Membership, timeout time.Duration) *event.Event {
+func waitForJoinedMember(t *testing.T, client *mautrix.Client, roomID id.RoomID, userID id.UserID, timeout time.Duration) {
 	t.Helper()
 
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-
-	for {
-		select {
-		case evt := <-c.memberEvents:
-			if evt.RoomID != roomID {
-				continue
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		members, err := client.JoinedMembers(context.Background(), roomID)
+		if err == nil {
+			if _, ok := members.Joined[userID]; ok {
+				return
 			}
-			if evt.GetStateKey() != userID.String() {
-				continue
-			}
-			if evt.Content.AsMember().Membership != membership {
-				continue
-			}
-			return evt
-		case err := <-c.done:
-			t.Fatalf("sync client exited while waiting for membership: %v", err)
-		case <-timer.C:
-			t.Fatalf("timed out waiting for %s membership for %s in room %s", membership, userID, roomID)
 		}
+		time.Sleep(250 * time.Millisecond)
 	}
+	t.Fatalf("timed out waiting for join membership for %s in room %s", userID, roomID)
 }
 
 func (c *syncingClient) waitForMessage(t *testing.T, roomID id.RoomID, sender id.UserID, body string, timeout time.Duration) *event.Event {
@@ -585,6 +575,13 @@ func requireDocker(t *testing.T) {
 	}
 	if output, err := runCommand(20*time.Second, "docker", "version", "--format", "{{.Server.Version}}"); err != nil {
 		t.Skipf("docker is required for live tuwunel tests: %v\n%s", err, output)
+	}
+}
+
+func requireLiveBotTests(t *testing.T) {
+	t.Helper()
+	if os.Getenv(liveEnvVar) == "" {
+		t.Skipf("set %s=1 to run live bot tests", liveEnvVar)
 	}
 }
 

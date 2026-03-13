@@ -1,0 +1,44 @@
+{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      auth_json: { type: "string", secret: true },
+      agents_md: { type: "string" },
+      matrix_username: { type: "string" },
+      matrix_password: { type: "string", secret: true },
+      bot_session_idle_timeout: { type: "string" },
+    },
+    required: [
+      "auth_json",
+      "matrix_username",
+      "matrix_password",
+      "bot_session_idle_timeout",
+    ],
+    additionalProperties: false,
+  },
+  slots: {
+    matrix: { kind: "http" },
+  },
+  components: {
+    agent: {
+      manifest: "https://raw.githubusercontent.com/ricelines/codex-a2a/refs/heads/main/amber.json5",
+      config: {
+        auth_json: "${config.auth_json}",
+        agents_md: "${config.agents_md}",
+      },
+    },
+    bot: {
+      manifest: "./onboarding-agent.json5",
+      config: {
+        matrix_username: "${config.matrix_username}",
+        matrix_password: "${config.matrix_password}",
+        bot_session_idle_timeout: "${config.bot_session_idle_timeout}",
+      },
+    },
+  },
+  bindings: [
+    { to: "#bot.matrix", from: "self.matrix", weak: true },
+    { to: "#bot.agent", from: "#agent.a2a" },
+  ],
+}

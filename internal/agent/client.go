@@ -44,7 +44,7 @@ func New(ctx context.Context, baseURL string) (*Client, error) {
 }
 
 func (c *Client) Send(ctx context.Context, req Request) (Response, error) {
-	blocking := false
+	blocking := true
 	historyLength := 8
 
 	params := &a2aproto.MessageSendParams{
@@ -87,8 +87,9 @@ func (c *Client) Send(ctx context.Context, req Request) (Response, error) {
 		return response, nil
 	}
 
-	// Non-blocking sends can interrupt on the initial submitted task. Re-read the
-	// task briefly so the caller receives the actual agent reply for this turn.
+	// Some agents still answer a blocking send with an initial task state before
+	// any user-visible reply is attached. Poll until the task yields a usable
+	// response or reaches a state that requires caller intervention.
 	return c.waitForTaskUpdate(ctx, response.TaskID)
 }
 
@@ -105,8 +106,9 @@ func (c *Client) CancelTask(ctx context.Context, taskID string) error {
 
 func (c *Client) waitForTaskUpdate(ctx context.Context, taskID string) (Response, error) {
 	historyLength := 8
+	deadline := time.Now().Add(10 * time.Second)
 
-	for i := 0; i < 20; i++ {
+	for {
 		task, err := c.client.GetTask(ctx, &a2aproto.TaskQueryParams{
 			ID:            a2aproto.TaskID(taskID),
 			HistoryLength: &historyLength,
@@ -119,22 +121,35 @@ func (c *Client) waitForTaskUpdate(ctx context.Context, taskID string) (Response
 		if err != nil {
 			return Response{}, err
 		}
-		if response.Reply != "" || response.State != a2aproto.TaskStateSubmitted {
+		if responseReady(response) {
 			return response, nil
+		}
+		if time.Now().After(deadline) {
+			return Response{}, fmt.Errorf("task %s did not produce a usable reply before timeout", taskID)
 		}
 
 		select {
 		case <-ctx.Done():
 			return Response{}, ctx.Err()
-		case <-time.After(25 * time.Millisecond):
+		case <-time.After(50 * time.Millisecond):
 		}
 	}
+}
 
-	task, err := c.client.GetTask(ctx, &a2aproto.TaskQueryParams{ID: a2aproto.TaskID(taskID)})
-	if err != nil {
-		return Response{}, fmt.Errorf("get task %s after retries: %w", taskID, err)
+func responseReady(response Response) bool {
+	if response.Reply != "" {
+		return true
 	}
-	return normalizeResult(task)
+	if response.State.Terminal() {
+		return true
+	}
+
+	switch response.State {
+	case a2aproto.TaskStateInputRequired, a2aproto.TaskStateAuthRequired:
+		return true
+	default:
+		return false
+	}
 }
 
 func buildMessage(req Request) *a2aproto.Message {

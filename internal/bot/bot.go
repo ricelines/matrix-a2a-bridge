@@ -186,12 +186,12 @@ func (b *Bot) handleMemberEvent(ctx context.Context, evt *event.Event) {
 		}
 
 		b.rememberRoomPeer(evt.RoomID, evt.Sender)
-		b.startOnboardingIfNeeded(ctx, evt.RoomID, evt.Sender, evt.ID.String(), false)
+		_ = b.markHandledEvent(evt.ID.String(), "member")
 	case event.MembershipJoin:
 		if evt.Sender != b.client.UserID {
 			return
 		}
-		b.startOnboardingIfNeeded(ctx, evt.RoomID, "", evt.ID.String(), true)
+		_ = b.markHandledEvent(evt.ID.String(), "member")
 	default:
 		return
 	}
@@ -306,92 +306,6 @@ func (b *Bot) renderReply(reply agent.Response) string {
 	return strings.TrimSpace(reply.Reply)
 }
 
-func (b *Bot) startOnboardingIfNeeded(ctx context.Context, roomID id.RoomID, hintedUserID id.UserID, sourceEventID string, requireFreshContext bool) {
-	now := time.Now().UTC()
-	if current, ok := b.sessions.Active(roomID, now); ok && current.TaskID != "" {
-		_ = b.markHandledEvent(sourceEventID, "member")
-		return
-	}
-
-	userID := hintedUserID
-	if userID == "" {
-		resolvedUserID, ok, err := b.resolveDirectPeer(ctx, roomID)
-		if err != nil {
-			b.log.Error("failed to resolve direct-message peer during onboarding start",
-				"room_id", roomID.String(),
-				"err", err,
-			)
-			return
-		}
-		if !ok {
-			_ = b.markHandledEvent(sourceEventID, "member")
-			return
-		}
-		userID = resolvedUserID
-	}
-
-	record, err := b.users.Load(ctx, userID)
-	if err != nil {
-		b.log.Error("failed to load user onboarding record",
-			"room_id", roomID.String(),
-			"user_id", userID.String(),
-			"err", err,
-		)
-		if b.replyWithFailure(ctx, roomID, stableTransactionID("invite-failure", sourceEventID)) == nil {
-			_ = b.markHandledEvent(sourceEventID, "member")
-		}
-		return
-	}
-	if record.Onboarded() {
-		_ = b.markHandledEvent(sourceEventID, "member")
-		return
-	}
-	if requireFreshContext && record.ContextID != "" {
-		_ = b.markHandledEvent(sourceEventID, "member")
-		return
-	}
-
-	reply, err := b.agent.Send(ctx, agent.Request{
-		Text:      "",
-		ContextID: record.ContextID,
-		Metadata:  requestMetadata(roomID, userID, "onboarding", "invite"),
-	})
-	if err != nil {
-		b.log.Error("failed to start onboarding via A2A",
-			"room_id", roomID.String(),
-			"user_id", userID.String(),
-			"err", err,
-		)
-		if b.replyWithFailure(ctx, roomID, stableTransactionID("invite-failure", sourceEventID)) == nil {
-			_ = b.markHandledEvent(sourceEventID, "member")
-		}
-		return
-	}
-
-	body := b.renderReply(reply)
-	if body == "" {
-		body = "Welcome. I'm ready to get you onboarded."
-	}
-	if err := b.sendText(ctx, roomID, stableTransactionID("invite-reply", sourceEventID), body); err != nil {
-		b.log.Error("failed to send onboarding opening message",
-			"room_id", roomID.String(),
-			"user_id", userID.String(),
-			"err", err,
-		)
-		return
-	}
-
-	if err := b.persistReplyState(ctx, roomID, userID, record, reply, now); err != nil {
-		b.log.Error("failed to persist onboarding state",
-			"room_id", roomID.String(),
-			"user_id", userID.String(),
-			"err", err,
-		)
-		return
-	}
-	_ = b.markHandledEvent(sourceEventID, "member")
-}
-
 func (b *Bot) persistReplyState(ctx context.Context, roomID id.RoomID, userID id.UserID, record userRecord, reply agent.Response, now time.Time) error {
 	updated := record
 	changed := false
@@ -412,7 +326,13 @@ func (b *Bot) persistReplyState(ctx context.Context, roomID id.RoomID, userID id
 		}
 	}
 
-	if reply.State.Terminal() || reply.TaskID == "" {
+	if reply.TaskID == "" {
+		b.sessions.Remove(roomID)
+		return nil
+	}
+	switch reply.State {
+	case a2aproto.TaskStateInputRequired, a2aproto.TaskStateAuthRequired:
+	default:
 		b.sessions.Remove(roomID)
 		return nil
 	}
