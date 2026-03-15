@@ -1,4 +1,4 @@
-module onboarding
+module matrix-a2a-bridge
 
 go 1.25.0
 

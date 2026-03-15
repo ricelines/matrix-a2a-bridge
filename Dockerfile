@@ -26,7 +26,7 @@ RUN --mount=type=cache,target=/go/pkg/mod,sharing=locked \
         -buildvcs=false \
         -trimpath \
         -ldflags='-s -w' \
-        -o /out/matrix-bot \
+        -o /out/matrix-a2a-bridge \
         ./cmd/matrix-bot && \
     go build \
         -buildvcs=false \
@@ -40,8 +40,8 @@ FROM gcr.io/distroless/static-debian13:nonroot
 
 WORKDIR /app
 
-COPY --from=build --chown=nonroot:nonroot /out/matrix-bot /app/matrix-bot
+COPY --from=build --chown=nonroot:nonroot /out/matrix-a2a-bridge /app/matrix-a2a-bridge
 COPY --from=build --chown=nonroot:nonroot /out/mock-a2a /app/mock-a2a
 COPY --from=build --chown=nonroot:nonroot /out/data /app/data
 
-ENTRYPOINT ["/app/matrix-bot"]
+ENTRYPOINT ["/app/matrix-a2a-bridge"]

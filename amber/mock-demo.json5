@@ -5,8 +5,8 @@
   },
   components: {
     mock_upstream: "./mock-a2a.json5",
-    onboarding_agent: {
-      manifest: "./onboarding-agent.json5",
+    matrix_a2a_bridge: {
+      manifest: "./matrix-a2a-bridge.json5",
       config: {
         matrix_username: "bot",
         matrix_password: "bot-password",
@@ -15,7 +15,7 @@
     },
   },
   bindings: [
-    { to: "#onboarding_agent.matrix", from: "self.matrix", weak: true },
-    { to: "#onboarding_agent.upstream_a2a", from: "#mock_upstream.a2a" },
+    { to: "#matrix_a2a_bridge.matrix", from: "self.matrix", weak: true },
+    { to: "#matrix_a2a_bridge.upstream_a2a", from: "#mock_upstream.a2a" },
   ],
 }

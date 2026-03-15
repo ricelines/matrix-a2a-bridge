@@ -6,9 +6,8 @@
       matrix_username: { type: "string" },
       matrix_password: { type: "string", secret: true },
       // How long an inactive upstream A2A-backed chat session stays alive before
-      // onboarding-agent cancels it and starts a new task on the next user
-      // message. Set this as a
-      // Go duration string such as "30s", "10m", or "1h".
+      // the bridge cancels it and starts a new task on the next user message.
+      // Set this as a Go duration string such as "30s", "10m", or "1h".
       bot_session_idle_timeout: { type: "string" },
     },
     additionalProperties: false,
@@ -22,8 +21,8 @@
     },
   },
   program: {
-    image: "ghcr.io/ricelines/onboarding-agent",
-    entrypoint: ["/app/matrix-bot"],
+    image: "ghcr.io/ricelines/matrix-a2a-bridge",
+    entrypoint: ["/app/matrix-a2a-bridge"],
     env: {
       MATRIX_HOMESERVER_URL: "${slots.matrix.url}",
       UPSTREAM_A2A_URL: "${slots.upstream_a2a.url}",

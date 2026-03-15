@@ -7,8 +7,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"onboarding/internal/bot"
-	"onboarding/internal/config"
+	"matrix-a2a-bridge/internal/bot"
+	"matrix-a2a-bridge/internal/config"
 )
 
 func main() {
@@ -22,7 +22,7 @@ func main() {
 
 	matrixRuntime, err := bot.New(cfg, logger)
 	if err != nil {
-		logger.Error("failed to create onboarding-agent Matrix runtime", "err", err)
+		logger.Error("failed to create Matrix A2A bridge runtime", "err", err)
 		os.Exit(1)
 	}
 
@@ -30,7 +30,7 @@ func main() {
 	defer stop()
 
 	if err := matrixRuntime.Run(ctx); err != nil {
-		logger.Error("onboarding-agent Matrix runtime stopped with error", "err", err)
+		logger.Error("Matrix A2A bridge runtime stopped with error", "err", err)
 		os.Exit(1)
 	}
 }

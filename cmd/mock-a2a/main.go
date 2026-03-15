@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"os"
 
-	"onboarding/internal/a2a"
+	"matrix-a2a-bridge/internal/a2a"
 )
 
 func main() {

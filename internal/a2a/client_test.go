@@ -3,8 +3,10 @@ package a2a
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 
@@ -66,7 +68,7 @@ func TestClientSendWaitsForUsableReplyAfterWorkingTask(t *testing.T) {
 		getTaskCalls int
 	)
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newLocalServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case a2asrv.WellKnownAgentCardPath:
 			a2asrv.NewStaticAgentCardHandler(testAgentCard(serverBaseURL(r))).ServeHTTP(w, r)
@@ -130,7 +132,6 @@ func TestClientSendWaitsForUsableReplyAfterWorkingTask(t *testing.T) {
 			t.Fatalf("unexpected JSON-RPC method %q", req.Method)
 		}
 	}))
-	defer server.Close()
 
 	client, err := New(context.Background(), server.URL)
 	if err != nil {
@@ -194,7 +195,7 @@ func writeJSONRPCResponse(t *testing.T, w http.ResponseWriter, id any, result an
 func testAgentCard(baseURL string) *a2aproto.AgentCard {
 	return &a2aproto.AgentCard{
 		Name:               "Test Agent",
-		Description:        "Test upstream A2A endpoint for onboarding-agent regression coverage.",
+		Description:        "Test upstream A2A endpoint for Matrix A2A bridge regression coverage.",
 		Version:            "test",
 		URL:                baseURL + mockA2AEndpointPath,
 		ProtocolVersion:    string(a2aproto.Version),
@@ -215,4 +216,23 @@ func serverBaseURL(r *http.Request) string {
 		scheme = "https"
 	}
 	return scheme + "://" + r.Host
+}
+
+func newLocalServer(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		if strings.Contains(err.Error(), "operation not permitted") || strings.Contains(err.Error(), "permission denied") {
+			t.Skipf("local listener unavailable in sandbox: %v", err)
+		}
+		t.Fatalf("Listen() error = %v", err)
+	}
+	server := &httptest.Server{
+		Listener: listener,
+		Config:   &http.Server{Handler: handler},
+	}
+	server.Start()
+	t.Cleanup(server.Close)
+	return server
 }

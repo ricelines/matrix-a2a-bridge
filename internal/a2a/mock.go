@@ -3,6 +3,7 @@ package a2a
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -31,7 +32,15 @@ type responsePlan struct {
 
 func StartMockServer() *MockServer {
 	mock := newMockServer()
-	server := httptest.NewServer(newMockHandler(mock))
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		panic(fmt.Sprintf("listen mock A2A server: %v", err))
+	}
+	server := &httptest.Server{
+		Listener: listener,
+		Config:   &http.Server{Handler: newMockHandler(mock)},
+	}
+	server.Start()
 	mock.server = server
 
 	return mock
@@ -103,7 +112,7 @@ func (m *MockServer) WasTaskCanceled(taskID string) bool {
 func (m *MockServer) agentCard(baseURL string) *a2aproto.AgentCard {
 	return &a2aproto.AgentCard{
 		Name:               "Mock Upstream A2A Agent",
-		Description:        "Mock upstream A2A endpoint used by onboarding-agent's Matrix runtime tests.",
+		Description:        "Mock upstream A2A endpoint used by the Matrix A2A bridge tests.",
 		Version:            "test",
 		URL:                baseURL + mockA2AEndpointPath,
 		ProtocolVersion:    string(a2aproto.Version),
@@ -180,7 +189,7 @@ func (e *mockExecutor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContex
 func (e *mockExecutor) Cancel(ctx context.Context, reqCtx *a2asrv.RequestContext, queue eventqueue.Queue) error {
 	e.mock.recordCancel(string(reqCtx.TaskID))
 
-	msg := buildAgentMessage(reqCtx, "I'll close this session here. Message me again when you're ready to continue.")
+	msg := buildAgentMessage(reqCtx, "I'll close this task here. Message me again when you're ready to continue.")
 	update := a2aproto.NewStatusUpdateEvent(reqCtx, a2aproto.TaskStateCanceled, msg)
 	update.Final = true
 
@@ -191,34 +200,19 @@ func (e *mockExecutor) Cancel(ctx context.Context, reqCtx *a2asrv.RequestContext
 }
 
 func buildPlan(reqCtx *a2asrv.RequestContext) responsePlan {
-	mode, _ := workflowMetadata(reqCtx.Metadata)
 	text := strings.TrimSpace(currentUserText(reqCtx.Message))
 	intent, hasIntent := parseIntent(text)
 
-	if mode == "onboarding" {
-		return onboardingPlan(reqCtx, intent, hasIntent)
-	}
-	return generalPlan(intent, hasIntent)
-}
-
-func onboardingPlan(reqCtx *a2asrv.RequestContext, intent string, hasIntent bool) responsePlan {
-	if reqCtx.StoredTask == nil {
-		return responsePlan{
-			State: a2aproto.TaskStateInputRequired,
-			Reply: "Welcome to Ricelines. I'll get you oriented. What should I call you?",
-		}
-	}
-
 	if hasIntent && intent == "close_session" {
 		return responsePlan{
 			State: a2aproto.TaskStateCompleted,
-			Reply: "No problem. We can pick up onboarding again the next time you message me.",
+			Reply: "I'll wrap up this A2A task now.",
 		}
 	}
 	if hasIntent {
-		reply := "We’re still onboarding. Answer the next question and I’ll stay available for follow-up requests after that."
+		reply := "I can keep this DM connected to an A2A task, preserve shared context per Matrix user, and continue the conversation naturally."
 		if intent == "status" {
-			reply = "You're still in onboarding. Once we finish, I'll keep helping in this DM."
+			reply = "This Matrix DM is connected to an A2A task and reuses the shared context for this Matrix user."
 		}
 		return responsePlan{
 			State: a2aproto.TaskStateInputRequired,
@@ -226,41 +220,16 @@ func onboardingPlan(reqCtx *a2asrv.RequestContext, intent string, hasIntent bool
 		}
 	}
 
-	switch len(reqCtx.StoredTask.History) {
-	case 2:
+	if reqCtx.StoredTask != nil {
 		return responsePlan{
 			State: a2aproto.TaskStateInputRequired,
-			Reply: "What brings you to Ricelines today?",
-		}
-	default:
-		return responsePlan{
-			State: a2aproto.TaskStateCompleted,
-			Reply: "Thanks. You're onboarded now, and you can keep chatting with me naturally whenever you need help.",
-		}
-	}
-}
-
-func generalPlan(intent string, hasIntent bool) responsePlan {
-	if hasIntent && intent == "close_session" {
-		return responsePlan{
-			State: a2aproto.TaskStateCompleted,
-			Reply: "I'll wrap up this session now.",
-		}
-	}
-	if hasIntent {
-		reply := "I can keep this DM connected to an A2A task, preserve shared context, and continue the conversation naturally."
-		if intent == "status" {
-			reply = "Your onboarding record is set, and this conversation is using the shared A2A context."
-		}
-		return responsePlan{
-			State: a2aproto.TaskStateInputRequired,
-			Reply: reply,
+			Reply: "I'm still connected to the same A2A task. Ask for help, ask for status, or tell me to close the task.",
 		}
 	}
 
 	return responsePlan{
 		State: a2aproto.TaskStateInputRequired,
-		Reply: "I'm here and ready to continue the conversation over A2A. Ask for help or status if you want to inspect the mock flow.",
+		Reply: "I received your message over Matrix and opened an A2A task. Ask for help, ask for status, or tell me to close the task.",
 	}
 }
 
@@ -315,14 +284,4 @@ func matrixMetadata(metadata map[string]any) (roomID string, userID string) {
 	roomID, _ = matrix["room_id"].(string)
 	userID, _ = matrix["user_id"].(string)
 	return roomID, userID
-}
-
-func workflowMetadata(metadata map[string]any) (mode string, trigger string) {
-	workflow, ok := metadata["workflow"].(map[string]any)
-	if !ok {
-		return "", ""
-	}
-	mode, _ = workflow["mode"].(string)
-	trigger, _ = workflow["trigger"].(string)
-	return mode, trigger
 }

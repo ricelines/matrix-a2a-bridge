@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path"
@@ -19,8 +20,8 @@ import (
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
-	"onboarding/internal/a2a"
-	"onboarding/internal/state"
+	"matrix-a2a-bridge/internal/a2a"
+	"matrix-a2a-bridge/internal/state"
 )
 
 const testAgentEndpointPath = "/rpc"
@@ -36,7 +37,7 @@ func TestPersistReplyStateStoresOnlyInterruptibleTasks(t *testing.T) {
 			TaskID:    "task-working",
 			ContextID: "ctx",
 			State:     a2aproto.TaskStateWorking,
-		}, now)
+		})
 		if err != nil {
 			t.Fatalf("persistReplyState() error = %v", err)
 		}
@@ -52,7 +53,7 @@ func TestPersistReplyStateStoresOnlyInterruptibleTasks(t *testing.T) {
 			TaskID:    "task-input",
 			ContextID: "ctx",
 			State:     a2aproto.TaskStateInputRequired,
-		}, now)
+		})
 		if err != nil {
 			t.Fatalf("persistReplyState() error = %v", err)
 		}
@@ -81,6 +82,7 @@ func TestHandleMessageEventWaitsForUsableReplyAndDoesNotReuseCompletedTask(t *te
 		TaskID    string
 		ContextID string
 		Text      string
+		Metadata  map[string]any
 	}
 
 	var (
@@ -89,7 +91,7 @@ func TestHandleMessageEventWaitsForUsableReplyAndDoesNotReuseCompletedTask(t *te
 		getTaskCalls int
 	)
 
-	a2aServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	a2aServer := newLocalServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case a2asrv.WellKnownAgentCardPath:
 			a2asrv.NewStaticAgentCardHandler(testAgentCard(serverBaseURL(r))).ServeHTTP(w, r)
@@ -117,6 +119,7 @@ func TestHandleMessageEventWaitsForUsableReplyAndDoesNotReuseCompletedTask(t *te
 				TaskID:    string(msg.TaskID),
 				ContextID: msg.ContextID,
 				Text:      currentUserText(msg),
+				Metadata:  params.Metadata,
 			}
 
 			a2aMu.Lock()
@@ -188,10 +191,8 @@ func TestHandleMessageEventWaitsForUsableReplyAndDoesNotReuseCompletedTask(t *te
 			t.Fatalf("unexpected JSON-RPC method %q", req.Method)
 		}
 	}))
-	defer a2aServer.Close()
 
 	matrixServer := newMatrixTestServer(t)
-	defer matrixServer.Close()
 
 	client, err := mautrix.NewClient(matrixServer.URL(), botUserID, "token")
 	if err != nil {
@@ -245,9 +246,6 @@ func TestHandleMessageEventWaitsForUsableReplyAndDoesNotReuseCompletedTask(t *te
 	if record.ContextID != contextID {
 		t.Fatalf("record.ContextID = %q, want %q", record.ContextID, contextID)
 	}
-	if record.OnboardedAt == nil {
-		t.Fatal("record.OnboardedAt is nil, want onboarding completion persisted")
-	}
 	if _, ok := bot.sessions.Active(roomID, time.Now().UTC()); ok {
 		t.Fatal("completed task unexpectedly remained active")
 	}
@@ -282,6 +280,16 @@ func TestHandleMessageEventWaitsForUsableReplyAndDoesNotReuseCompletedTask(t *te
 	if a2aMessages[0].Text != "hello" {
 		t.Fatalf("first A2A message.Text = %q, want %q", a2aMessages[0].Text, "hello")
 	}
+	if _, ok := a2aMessages[0].Metadata["workflow"]; ok {
+		t.Fatalf("first A2A message metadata unexpectedly included workflow data: %+v", a2aMessages[0].Metadata)
+	}
+	matrixMetadata, ok := a2aMessages[0].Metadata["matrix"].(map[string]any)
+	if !ok {
+		t.Fatalf("first A2A message metadata = %+v, want matrix metadata", a2aMessages[0].Metadata)
+	}
+	if matrixMetadata["room_id"] != roomID.String() || matrixMetadata["user_id"] != userID.String() {
+		t.Fatalf("first A2A message matrix metadata = %+v, want room/user IDs", matrixMetadata)
+	}
 	if a2aMessages[1].TaskID != "" {
 		t.Fatalf("second A2A message.TaskID = %q, want empty after completed first task", a2aMessages[1].TaskID)
 	}
@@ -311,7 +319,7 @@ func newMatrixTestServer(t *testing.T) *matrixTestServer {
 		t:           t,
 		accountData: make(map[string]json.RawMessage),
 	}
-	server.server = httptest.NewServer(http.HandlerFunc(server.handle))
+	server.server = newLocalServer(t, http.HandlerFunc(server.handle))
 	return server
 }
 
@@ -432,7 +440,7 @@ func writeJSONRPCResponse(t *testing.T, w http.ResponseWriter, id any, result an
 func testAgentCard(baseURL string) *a2aproto.AgentCard {
 	return &a2aproto.AgentCard{
 		Name:               "Test Agent",
-		Description:        "Test upstream A2A endpoint for onboarding-agent regression coverage.",
+		Description:        "Test upstream A2A endpoint for Matrix A2A bridge regression coverage.",
 		Version:            "test",
 		URL:                baseURL + testAgentEndpointPath,
 		ProtocolVersion:    string(a2aproto.Version),
@@ -453,6 +461,25 @@ func serverBaseURL(r *http.Request) string {
 		scheme = "https"
 	}
 	return scheme + "://" + r.Host
+}
+
+func newLocalServer(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		if strings.Contains(err.Error(), "operation not permitted") || strings.Contains(err.Error(), "permission denied") {
+			t.Skipf("local listener unavailable in sandbox: %v", err)
+		}
+		t.Fatalf("Listen() error = %v", err)
+	}
+	server := &httptest.Server{
+		Listener: listener,
+		Config:   &http.Server{Handler: handler},
+	}
+	server.Start()
+	t.Cleanup(server.Close)
+	return server
 }
 
 func currentUserText(msg *a2aproto.Message) string {

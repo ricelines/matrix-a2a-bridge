@@ -6,21 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-	"time"
 
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/id"
 )
 
-const userBucketEventPrefix = "com.ricelines.onboarding.users"
+const userBucketEventPrefix = "com.ricelines.matrix_a2a_bridge.users"
 
 type userRecord struct {
-	ContextID   string     `json:"context_id,omitempty"`
-	OnboardedAt *time.Time `json:"onboarded_at,omitempty"`
-}
-
-func (r userRecord) Onboarded() bool {
-	return r.OnboardedAt != nil
+	ContextID string `json:"context_id,omitempty"`
 }
 
 type userBucket struct {

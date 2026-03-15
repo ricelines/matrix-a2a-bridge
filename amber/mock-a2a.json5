@@ -1,7 +1,7 @@
 {
   manifest_version: "0.1.0",
   program: {
-    image: "ghcr.io/ricelines/onboarding-agent",
+    image: "ghcr.io/ricelines/matrix-a2a-bridge",
     entrypoint: ["/app/mock-a2a", "--listen", ":8080"],
     network: {
       endpoints: [{ name: "a2a", port: 8080, protocol: "http" }],

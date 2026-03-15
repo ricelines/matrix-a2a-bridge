@@ -1,35 +1,38 @@
-# Onboarding Agent
+# Matrix A2A Bridge
 
-This repo contains `onboarding-agent`, a Matrix-based onboarding agent written in Go. Users talk to it in a Matrix DM. Its Matrix runtime accepts the DM invite, starts the one-time onboarding flow when the user sends the first message in the DM, and forwards later natural-language turns to an upstream A2A HTTP endpoint.
+This repo contains a Matrix DM runtime that bridges a Matrix account to an upstream A2A agent.
+It is not an onboarding workflow by itself. Product-specific onboarding belongs in the upstream
+agent or in a separate Amber assembly that composes this bridge with the right agent.
 
 ## Behavior
 
 - logs in to a Matrix homeserver with password auth, then persists the resulting runtime session locally for restart and recovery
-- runs a replay-safe `/sync` loop and keeps deterministic Matrix transaction IDs for bot replies
-- joins DM invites automatically and opens onboarding when the user sends the first message in a direct chat
-- persists only Matrix runtime session state locally; per-user onboarding state and shared context live in Matrix account data so deployment does not require a separate database
+- joins direct-message invites automatically
+- forwards Matrix text messages to an upstream A2A HTTP endpoint
+- sends the upstream agent reply back into the Matrix room as a normal text message
 - keeps per-room A2A task sessions in memory and cancels them after inactivity
-- keeps talking to the user in normal text messages rather than slash-style commands
-- uses standard A2A messages, tasks, task states, and context IDs as its upstream contract
+- persists a shared per-user A2A context ID in Matrix account data so later rooms and restarted runtimes can reuse the same context
+- persists only Matrix runtime state locally; it does not require a separate database
 
 ## A2A Integration
 
-The Matrix runtime expects an upstream A2A URL and resolves the upstream agent card from `/.well-known/agent-card.json`.
+The runtime expects an upstream A2A URL and resolves the agent card from
+`/.well-known/agent-card.json`.
 
-For each DM turn it sends:
+For each Matrix DM turn it sends:
 
 - the user text
 - the current task ID when the room already has an active session
-- the shared context ID for that user when available
+- the shared context ID for that Matrix user when available
 - Matrix metadata such as the room ID and user ID
 
-The response is expected to contain:
+The upstream response is expected to contain:
 
 - a natural-language text reply
 - standard A2A task state and task/context identifiers when the conversation remains active
-- optional artifacts, with the bot falling back to the latest text artifact when the status message itself has no text
+- optional artifacts, with the bridge falling back to the latest text artifact when the status message itself has no text
 
-`internal/a2a/mock.go` provides the mock upstream A2A system used by the live tests.
+`internal/a2a/mock.go` provides the mock upstream A2A server used by the tests and the local Amber demo.
 
 ## Configuration
 
@@ -46,20 +49,26 @@ Optional:
 - `BOT_SESSION_IDLE_TIMEOUT` defaults to `10m`
 
 `MATRIX_USERNAME` can be either a localpart such as `bot` or a full Matrix user ID such as `@bot:example.com`.
-On first start the Matrix runtime logs in with the configured password, then persists the returned Matrix access token and device ID in its local state. Subsequent restarts reuse that stored session and only fall back to password login if the stored token is missing or no longer valid.
+
+On first start the runtime logs in with the configured password, then persists the returned Matrix
+access token and device ID in its local state. Subsequent restarts reuse that stored session and
+fall back to password login only if the stored token is missing or no longer valid.
 
 ## Persistence
 
-- Local state file:
-  - Matrix access token
-  - device ID
-  - sync cursor
-  - handled-event journal
-- Matrix account data:
-  - per-user onboarding completion marker
-  - shared A2A context ID used to link later sessions
+Local state file:
 
-That split keeps deployment simple while making the one-time onboarding record survive bot restarts without introducing a separate database.
+- Matrix access token
+- device ID
+- sync cursor
+- handled-event journal
+
+Matrix account data:
+
+- shared per-user A2A context ID
+
+That split keeps deployment simple while still allowing the upstream agent context to survive bot
+restarts and new DM rooms.
 
 ## Run
 
@@ -67,43 +76,26 @@ That split keeps deployment simple while making the one-time onboarding record s
 go run ./cmd/matrix-bot
 ```
 
-## Amber Scenario
+## Amber Manifests
 
-This repo also includes an Amber scenario that runs `onboarding-agent` against a `codex-a2a`
-delegate agent while leaving the Matrix homeserver outside the scenario. The checked-in scenario lives at
-`amber/onboarding-codex-a2a.json5` and is parameterized at the root rather than hardcoding local
-credentials.
+- `amber/matrix-a2a-bridge.json5` is the generic component manifest for this runtime
+- `amber/mock-demo.json5` composes the bridge with the bundled mock A2A server for local testing
+- `amber/codex-a2a-demo.json5` is an example composition with `codex-a2a`
 
-Its root config schema accepts:
+If you want an onboarding experience, compose this bridge with an onboarding-oriented upstream
+agent in a different repo. That assembly does not belong here.
 
-- `auth_json`
-- `matrix_username`
-- `matrix_password`
-- `bot_session_idle_timeout`
+### Example: Codex A2A Demo
 
-Amber wires those root config values into the generated Docker Compose runtime as environment
-variables. When you compile this scenario, Amber emits an `env.example` containing:
+Start a Matrix homeserver separately. The bridge does not create its own Matrix account, so the bot
+username and password must already exist before the Amber stack starts.
 
-- `AMBER_CONFIG_AUTH_JSON`
-- `AMBER_CONFIG_MATRIX_USERNAME`
-- `AMBER_CONFIG_MATRIX_PASSWORD`
-- `AMBER_CONFIG_BOT_SESSION_IDLE_TIMEOUT`
-
-That is the runtime config path for this scenario. `~/.codex/config.toml` is not required and
-should not be forwarded for this setup.
-
-### Register The Bot On Tuwunel
-
-Start `tuwunel` separately from the Amber stack. The onboarding bot does not create its own Matrix
-account, so the bot username and password must already exist on the homeserver before the Amber
-stack starts.
-
-This example provisions both a human test user and the bot account at tuwunel startup:
+This example provisions both a human test user and the bot account with `tuwunel`:
 
 ```bash
 mkdir -p .tmp-tuwunel-data
 docker run --rm -d \
-  --name onboarding-tuwunel \
+  --name matrix-a2a-bridge-tuwunel \
   -p 127.0.0.1:6167:6167 \
   -v "$PWD/.tmp-tuwunel-data:/var/lib/tuwunel" \
   -e TUWUNEL_SERVER_NAME=tuwunel.test \
@@ -116,22 +108,15 @@ docker run --rm -d \
   --execute "users create_user bot bot-password"
 ```
 
-If you already have a local tuwunel container, create the bot account there first. The important
-invariant is simple: the `matrix_username` and `matrix_password` you pass into the Amber scenario
-must match an already-registered Matrix account on the external tuwunel server.
-
-### Compile And Run The Amber Stack
-
-Compile the checked-in scenario directly:
+Compile the Amber example:
 
 ```bash
-amber check amber/onboarding-codex-a2a.json5
-amber compile amber/onboarding-codex-a2a.json5 \
-  --docker-compose /tmp/onboarding-amber-compose
+amber check amber/codex-a2a-demo.json5
+amber compile amber/codex-a2a-demo.json5 \
+  --docker-compose /tmp/matrix-a2a-bridge-compose
 ```
 
-Amber will generate `/tmp/onboarding-amber-compose/env.example`. Fill in the required runtime
-config there. The bot account values must match the Matrix account you provisioned on tuwunel:
+Fill in `/tmp/matrix-a2a-bridge-compose/env.example` and then start the generated stack:
 
 ```dotenv
 AMBER_CONFIG_MATRIX_USERNAME=bot
@@ -140,85 +125,30 @@ AMBER_CONFIG_BOT_SESSION_IDLE_TIMEOUT=10m
 AMBER_EXTERNAL_SLOT_MATRIX_URL=127.0.0.1:6167
 ```
 
-For `AMBER_CONFIG_AUTH_JSON`, pass the contents of `~/.codex/auth.json` as the runtime config
-value. Amber expects the raw file contents, not a path and not `config.toml`.
-
-Then start the stack from the generated compose directory:
+`AMBER_CONFIG_AUTH_JSON` should contain the contents of `~/.codex/auth.json`.
 
 ```bash
-cd /tmp/onboarding-amber-compose
+cd /tmp/matrix-a2a-bridge-compose
 cp env.example .env
 $EDITOR .env
 docker compose up -d
+amber proxy /tmp/matrix-a2a-bridge-compose --slot matrix=127.0.0.1:6167
 ```
 
-Wait until the router, the onboarding-agent runtime, and the `codex-a2a` component are up in `docker ps`, then attach the
-external Matrix slot to the tuwunel server that is already running on the host:
-
-```bash
-amber proxy /tmp/onboarding-amber-compose \
-  --slot matrix=127.0.0.1:6167
-```
-
-Leave `amber proxy` running. It is the bridge between the Amber router and the external Matrix
-homeserver.
-
-Run the proxy with `-v` or `-vv` if you want an explicit confirmation that the slot attached
-correctly. A healthy attachment prints a line like:
-
-```text
-registered slot matrix via router control (...)
-```
-
-The Matrix runtime attempts password login immediately on startup and exits if the Matrix slot is not
-ready yet. If the onboarding-agent container logs `HTTP 502` or `HTTP 503` from `/_matrix/client/v3/login`, leave
-`amber proxy` running after it prints the registration line, then restart just that container:
-
-```bash
-docker compose up -d <onboarding-agent-service>
-```
-
-To tear the scenario down later:
-
-```bash
-docker compose -f /tmp/onboarding-amber-compose/compose.yaml down
-docker stop onboarding-tuwunel
-```
-
-### Test With Element
-
-Element Desktop is the easiest option for this local setup because you can point it directly at
-the plain HTTP homeserver URL.
-
-1. Open Element Desktop.
-2. Choose the custom homeserver option and set the homeserver URL to `http://127.0.0.1:6167`.
-3. Sign in as `alice` with password `alice-password`.
-4. Start a direct chat with `@bot:tuwunel.test`.
-5. Send any message. The bot should join the DM and begin the onboarding flow with the welcome
-   prompt.
-6. Finish the onboarding prompts, then send a normal follow-up question to confirm that onboarding-agent is
-   forwarding later turns to the upstream `codex-a2a` agent.
-
-If the bot does not answer, check these first:
-
-- `amber proxy` is still running, points at `127.0.0.1:6167`, and printed `registered slot matrix via router control`
-- the bot account exists on tuwunel and the password matches the scenario manifest
-- `docker ps -a` still shows the onboarding-agent container as running; if it exited after `HTTP 502` or `HTTP 503`, restart that service with `docker compose up -d <onboarding-agent-service>`
-- `docker compose -f /tmp/onboarding-amber-compose/compose.yaml logs <onboarding-agent-service>`
-- `docker compose -f /tmp/onboarding-amber-compose/compose.yaml logs <codex-agent-service>`
+Once the stack is up, sign into Element against `http://127.0.0.1:6167`, start a DM with
+`@bot:tuwunel.test`, and send a message. The bridge should join the room and forward the chat to
+the upstream A2A agent.
 
 ## Tests
 
-`go test ./...` runs the default unit and in-process coverage.
-
-The live bot suite is opt-in and spins up:
-
-- a dockerized `tuwunel` homeserver
-- a live Matrix user and bot account
-- the in-process mock A2A server
-
-Run it with:
+Unit and in-process tests:
 
 ```bash
-ONBOARDING_RUN_LIVE=1 go test ./internal/bot
+GOCACHE=$(pwd)/.cache/go-build go test ./...
+```
+
+Live Matrix tests:
+
+```bash
+MATRIX_A2A_BRIDGE_RUN_LIVE=1 GOCACHE=$(pwd)/.cache/go-build go test ./internal/bot
 ```

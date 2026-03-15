@@ -23,8 +23,8 @@
         model_reasoning_effort: "low",
       },
     },
-    onboarding_agent: {
-      manifest: "./onboarding-agent.json5",
+    matrix_a2a_bridge: {
+      manifest: "./matrix-a2a-bridge.json5",
       config: {
         matrix_username: "${config.matrix_username}",
         matrix_password: "${config.matrix_password}",
@@ -33,7 +33,7 @@
     },
   },
   bindings: [
-    { to: "#onboarding_agent.matrix", from: "self.matrix", weak: true },
-    { to: "#onboarding_agent.upstream_a2a", from: "#codex_agent.a2a" },
+    { to: "#matrix_a2a_bridge.matrix", from: "self.matrix", weak: true },
+    { to: "#matrix_a2a_bridge.upstream_a2a", from: "#codex_agent.a2a" },
   ],
 }

@@ -16,9 +16,9 @@ import (
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
-	"onboarding/internal/a2a"
-	"onboarding/internal/config"
-	"onboarding/internal/state"
+	"matrix-a2a-bridge/internal/a2a"
+	"matrix-a2a-bridge/internal/config"
+	"matrix-a2a-bridge/internal/state"
 )
 
 type Bot struct {
@@ -83,7 +83,7 @@ func (b *Bot) Run(ctx context.Context) error {
 
 	go b.runSessionReaper(ctx)
 
-	b.log.Info("starting onboarding-agent Matrix runtime",
+	b.log.Info("starting Matrix A2A bridge runtime",
 		"user_id", b.client.UserID.String(),
 		"homeserver", b.client.HomeserverURL.String(),
 		"state_path", b.config.StatePath,
@@ -126,7 +126,7 @@ func (b *Bot) loginWithPassword(ctx context.Context) error {
 			User: usernameForLogin(b.config.Username),
 		},
 		Password:                 b.config.Password,
-		InitialDeviceDisplayName: "onboarding-agent",
+		InitialDeviceDisplayName: "matrix-a2a-bridge",
 		StoreCredentials:         true,
 	}
 	if b.client.DeviceID != "" {
@@ -233,7 +233,7 @@ func (b *Bot) handleMessageEvent(ctx context.Context, evt *event.Event) {
 
 	record, err := b.users.Load(ctx, userID)
 	if err != nil {
-		b.log.Error("failed to load user onboarding record",
+		b.log.Error("failed to load user context",
 			"room_id", evt.RoomID.String(),
 			"user_id", userID.String(),
 			"err", err,
@@ -252,7 +252,7 @@ func (b *Bot) handleMessageEvent(ctx context.Context, evt *event.Event) {
 	req := a2a.Request{
 		Text:      body,
 		ContextID: record.ContextID,
-		Metadata:  requestMetadata(evt.RoomID, userID, conversationMode(record), "message"),
+		Metadata:  requestMetadata(evt.RoomID, userID),
 	}
 	if current, ok := b.sessions.Active(evt.RoomID, now); ok {
 		req.TaskID = current.TaskID
@@ -289,7 +289,7 @@ func (b *Bot) handleMessageEvent(ctx context.Context, evt *event.Event) {
 		return
 	}
 
-	if err := b.persistReplyState(ctx, evt.RoomID, userID, record, reply, now); err != nil {
+	if err := b.persistReplyState(ctx, evt.RoomID, userID, record, reply); err != nil {
 		b.log.Error("failed to persist conversation state",
 			"room_id", evt.RoomID.String(),
 			"user_id", userID.String(),
@@ -306,17 +306,12 @@ func (b *Bot) renderReply(reply a2a.Response) string {
 	return strings.TrimSpace(reply.Reply)
 }
 
-func (b *Bot) persistReplyState(ctx context.Context, roomID id.RoomID, userID id.UserID, record userRecord, reply a2a.Response, now time.Time) error {
+func (b *Bot) persistReplyState(ctx context.Context, roomID id.RoomID, userID id.UserID, record userRecord, reply a2a.Response) error {
 	updated := record
 	changed := false
 
 	if reply.ContextID != "" && reply.ContextID != updated.ContextID {
 		updated.ContextID = reply.ContextID
-		changed = true
-	}
-	if !updated.Onboarded() && conversationMode(record) == "onboarding" && reply.State == a2aproto.TaskStateCompleted {
-		timestamp := now
-		updated.OnboardedAt = &timestamp
 		changed = true
 	}
 
@@ -346,7 +341,7 @@ func (b *Bot) persistReplyState(ctx context.Context, roomID id.RoomID, userID id
 		UserID:       userID,
 		TaskID:       reply.TaskID,
 		ContextID:    contextID,
-		LastActivity: now,
+		LastActivity: time.Now().UTC(),
 	})
 	return nil
 }
@@ -460,24 +455,13 @@ func (b *Bot) markHandledEvent(eventID, eventKind string) error {
 	return nil
 }
 
-func requestMetadata(roomID id.RoomID, userID id.UserID, mode, trigger string) map[string]any {
+func requestMetadata(roomID id.RoomID, userID id.UserID) map[string]any {
 	return map[string]any{
 		"matrix": map[string]any{
 			"room_id": roomID.String(),
 			"user_id": userID.String(),
 		},
-		"workflow": map[string]any{
-			"mode":    mode,
-			"trigger": trigger,
-		},
 	}
-}
-
-func conversationMode(record userRecord) string {
-	if record.Onboarded() {
-		return "general"
-	}
-	return "onboarding"
 }
 
 func (b *Bot) syncWithResume(ctx context.Context) error {
@@ -610,7 +594,7 @@ func stripInitialRoomHistory(resp *mautrix.RespSync) {
 
 func stableTransactionID(kind, input string) string {
 	sum := sha256.Sum256([]byte(kind + ":" + input))
-	return fmt.Sprintf("onboarding_%s_%x", kind, sum[:8])
+	return fmt.Sprintf("matrix_a2a_bridge_%s_%x", kind, sum[:8])
 }
 
 func minDuration(a, b time.Duration) time.Duration {

@@ -20,10 +20,10 @@ import (
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
-	"onboarding/internal/a2a"
-	botpkg "onboarding/internal/bot"
-	"onboarding/internal/config"
-	"onboarding/internal/state"
+	"matrix-a2a-bridge/internal/a2a"
+	botpkg "matrix-a2a-bridge/internal/bot"
+	"matrix-a2a-bridge/internal/config"
+	"matrix-a2a-bridge/internal/state"
 )
 
 const (
@@ -34,10 +34,10 @@ const (
 	alicePassword      = "alice-password"
 	botUser            = "bot"
 	botPassword        = "bot-password"
-	liveEnvVar         = "ONBOARDING_RUN_LIVE"
+	liveEnvVar         = "MATRIX_A2A_BRIDGE_RUN_LIVE"
 )
 
-func TestBotStartsOnboardingOnFirstDirectMessage(t *testing.T) {
+func TestBotStartsTaskOnFirstDirectMessage(t *testing.T) {
 	harness := newLiveHarness(t)
 	harness.startBot(t)
 
@@ -45,22 +45,17 @@ func TestBotStartsOnboardingOnFirstDirectMessage(t *testing.T) {
 	harness.alice.waitForNoMessageFrom(t, roomID, harness.botUserID, 5*time.Second)
 
 	harness.alice.sendText(t, roomID, "Hi")
-	harness.alice.waitForMessage(t, roomID, harness.botUserID, "Welcome to Ricelines. I'll get you oriented. What should I call you?", 20*time.Second)
-
-	harness.alice.sendText(t, roomID, "Call me Alice")
-	harness.alice.waitForMessage(t, roomID, harness.botUserID, "What brings you to Ricelines today?", 20*time.Second)
-
-	harness.alice.sendText(t, roomID, "I'm here to explore")
-	harness.alice.waitForMessage(t, roomID, harness.botUserID, "Thanks. You're onboarded now, and you can keep chatting with me naturally whenever you need help.", 20*time.Second)
+	harness.alice.waitForMessage(t, roomID, harness.botUserID, "I received your message over Matrix and opened an A2A task. Ask for help, ask for status, or tell me to close the task.", 20*time.Second)
 }
 
-func TestBotOnboardsOnlyOnceAcrossRestart(t *testing.T) {
+func TestBotPersistsSharedContextAcrossRestart(t *testing.T) {
 	harness := newLiveHarness(t)
 	harness.startBot(t)
 
 	firstRoomID := harness.createDirectRoomWithBot(t)
-	harness.completeOnboarding(t, firstRoomID)
-	harness.waitForOnboardingRecord(t)
+	harness.alice.sendText(t, firstRoomID, "status please")
+	harness.alice.waitForMessageContaining(t, firstRoomID, harness.botUserID, "This Matrix DM is connected to an A2A task and reuses the shared context for this Matrix user.", 20*time.Second)
+	harness.waitForUserContext(t)
 
 	harness.stopBot(t)
 	harness.startBot(t)
@@ -69,7 +64,11 @@ func TestBotOnboardsOnlyOnceAcrossRestart(t *testing.T) {
 	harness.alice.waitForNoMessageFrom(t, secondRoomID, harness.botUserID, 5*time.Second)
 
 	harness.alice.sendText(t, secondRoomID, "Can you show my status?")
-	harness.alice.waitForMessageContaining(t, secondRoomID, harness.botUserID, "Your onboarding record is set, and this conversation is using the shared A2A context.", 20*time.Second)
+	harness.alice.waitForMessageContaining(t, secondRoomID, harness.botUserID, "This Matrix DM is connected to an A2A task and reuses the shared context for this Matrix user.", 20*time.Second)
+
+	if got := harness.upstream.ContextCountForUser(harness.aliceUserID.String()); got != 1 {
+		t.Fatalf("ContextCountForUser() = %d, want 1 shared context across restart", got)
+	}
 }
 
 func TestBotStartsNewTaskAfterIdleTimeout(t *testing.T) {
@@ -77,31 +76,30 @@ func TestBotStartsNewTaskAfterIdleTimeout(t *testing.T) {
 	harness.startBot(t)
 
 	roomID := harness.createDirectRoomWithBot(t)
-	harness.completeOnboarding(t, roomID)
 
 	harness.alice.sendText(t, roomID, "What can you do?")
-	harness.alice.waitForMessageContaining(t, roomID, harness.botUserID, "I can keep this DM connected to an A2A task, preserve shared context, and continue the conversation naturally.", 20*time.Second)
+	harness.alice.waitForMessageContaining(t, roomID, harness.botUserID, "I can keep this DM connected to an A2A task, preserve shared context per Matrix user, and continue the conversation naturally.", 20*time.Second)
 
 	waitForCondition(t, 10*time.Second, func() bool {
-		return harness.upstream.TaskCountForRoom(roomID.String()) == 2
-	}, "first post-onboarding task was not created")
+		return harness.upstream.TaskCountForRoom(roomID.String()) == 1
+	}, "first task was not created")
 
 	taskIDs := harness.upstream.TaskIDsForRoom(roomID.String())
-	if len(taskIDs) != 2 {
-		t.Fatalf("unexpected task IDs after first post-onboarding message: %v", taskIDs)
+	if len(taskIDs) != 1 {
+		t.Fatalf("unexpected task IDs after first message: %v", taskIDs)
 	}
-	firstGeneralTaskID := taskIDs[1]
+	firstTaskID := taskIDs[0]
 
 	waitForCondition(t, harness.sessionIdleTimeout+5*time.Second, func() bool {
-		return harness.upstream.WasTaskCanceled(firstGeneralTaskID)
+		return harness.upstream.WasTaskCanceled(firstTaskID)
 	}, "idle session task was not canceled")
 
 	harness.alice.sendText(t, roomID, "status please")
-	harness.alice.waitForMessageContaining(t, roomID, harness.botUserID, "Your onboarding record is set, and this conversation is using the shared A2A context.", 20*time.Second)
+	harness.alice.waitForMessageContaining(t, roomID, harness.botUserID, "This Matrix DM is connected to an A2A task and reuses the shared context for this Matrix user.", 20*time.Second)
 
 	waitForCondition(t, 10*time.Second, func() bool {
-		return harness.upstream.TaskCountForRoom(roomID.String()) == 3
-	}, "second post-idle task was not created")
+		return harness.upstream.TaskCountForRoom(roomID.String()) == 2
+	}, "second task after idle timeout was not created")
 
 	if got := harness.upstream.ContextCountForUser(harness.aliceUserID.String()); got != 1 {
 		t.Fatalf("ContextCountForUser() = %d, want 1 shared context", got)
@@ -240,28 +238,16 @@ func (h *liveHarness) createDirectRoomWithBot(t *testing.T) id.RoomID {
 	return room.RoomID
 }
 
-func (h *liveHarness) completeOnboarding(t *testing.T, roomID id.RoomID) {
-	t.Helper()
-
-	h.alice.sendText(t, roomID, "Hi")
-	h.alice.waitForMessage(t, roomID, h.botUserID, "Welcome to Ricelines. I'll get you oriented. What should I call you?", 20*time.Second)
-	h.alice.sendText(t, roomID, "Alice")
-	h.alice.waitForMessage(t, roomID, h.botUserID, "What brings you to Ricelines today?", 20*time.Second)
-	h.alice.sendText(t, roomID, "I want to learn the system")
-	h.alice.waitForMessage(t, roomID, h.botUserID, "Thanks. You're onboarded now, and you can keep chatting with me naturally whenever you need help.", 20*time.Second)
-}
-
-func (h *liveHarness) waitForOnboardingRecord(t *testing.T) {
+func (h *liveHarness) waitForUserContext(t *testing.T) {
 	t.Helper()
 
 	client := newLoggedInClient(t, h.server.baseURL(), botUser, botPassword)
-	eventType := onboardingBucketEventType(h.aliceUserID)
+	eventType := userBucketEventType(h.aliceUserID)
 
 	waitForCondition(t, 10*time.Second, func() bool {
 		var bucket struct {
 			Users map[string]struct {
-				ContextID   string     `json:"context_id,omitempty"`
-				OnboardedAt *time.Time `json:"onboarded_at,omitempty"`
+				ContextID string `json:"context_id,omitempty"`
 			} `json:"users,omitempty"`
 		}
 		if err := client.GetAccountData(context.Background(), eventType, &bucket); err != nil {
@@ -269,8 +255,8 @@ func (h *liveHarness) waitForOnboardingRecord(t *testing.T) {
 		}
 
 		record, ok := bucket.Users[h.aliceUserID.String()]
-		return ok && record.OnboardedAt != nil && record.ContextID != ""
-	}, "bot did not persist onboarding record")
+		return ok && record.ContextID != ""
+	}, "bot did not persist shared user context")
 }
 
 type runningBot struct {
@@ -292,7 +278,7 @@ func newTuwunelContainer(t *testing.T) *tuwunelContainer {
 	tempDir := mustTempDirInCurrentTree(t, ".tmp-tuwunel-")
 	container := &tuwunelContainer{
 		t:        t,
-		name:     fmt.Sprintf("onboarding-tuwunel-%d", time.Now().UnixNano()),
+		name:     fmt.Sprintf("matrix-a2a-bridge-tuwunel-%d", time.Now().UnixNano()),
 		tempDir:  tempDir,
 		hostPort: reserveHostPort(t),
 	}
@@ -471,9 +457,9 @@ func newLoggedInClient(t *testing.T, homeserverURL, username, password string) *
 	return client
 }
 
-func onboardingBucketEventType(userID id.UserID) string {
+func userBucketEventType(userID id.UserID) string {
 	sum := sha256.Sum256([]byte(userID))
-	return fmt.Sprintf("com.ricelines.onboarding.users.%02x", sum[0])
+	return fmt.Sprintf("com.ricelines.matrix_a2a_bridge.users.%02x", sum[0])
 }
 
 func (c *syncingClient) sendText(t *testing.T, roomID id.RoomID, body string) {
