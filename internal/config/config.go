@@ -16,7 +16,7 @@ const (
 	envUsername           = "MATRIX_USERNAME"
 	envPassword           = "MATRIX_PASSWORD"
 	envStatePath          = "MATRIX_STATE_PATH"
-	envA2AAgentURL        = "A2A_AGENT_URL"
+	envUpstreamA2AURL     = "UPSTREAM_A2A_URL"
 	envSessionIdleTimeout = "BOT_SESSION_IDLE_TIMEOUT"
 )
 
@@ -25,17 +25,17 @@ type Config struct {
 	Username           string
 	Password           string
 	StatePath          string
-	A2AAgentURL        string
+	UpstreamA2AURL     string
 	SessionIdleTimeout time.Duration
 }
 
 func FromEnv() (Config, error) {
 	cfg := Config{
-		HomeserverURL: strings.TrimSpace(os.Getenv(envHomeserverURL)),
-		Username:      strings.TrimSpace(os.Getenv(envUsername)),
-		Password:      strings.TrimSpace(os.Getenv(envPassword)),
-		StatePath:     strings.TrimSpace(os.Getenv(envStatePath)),
-		A2AAgentURL:   strings.TrimSpace(os.Getenv(envA2AAgentURL)),
+		HomeserverURL:  strings.TrimSpace(os.Getenv(envHomeserverURL)),
+		Username:       strings.TrimSpace(os.Getenv(envUsername)),
+		Password:       strings.TrimSpace(os.Getenv(envPassword)),
+		StatePath:      strings.TrimSpace(os.Getenv(envStatePath)),
+		UpstreamA2AURL: strings.TrimSpace(os.Getenv(envUpstreamA2AURL)),
 	}
 	if cfg.StatePath == "" {
 		cfg.StatePath = defaultStatePath
@@ -59,8 +59,8 @@ func (c Config) Validate() error {
 	if c.StatePath == "" {
 		problems = append(problems, "state path must not be empty")
 	}
-	if c.A2AAgentURL == "" {
-		problems = append(problems, envA2AAgentURL+" is required")
+	if c.UpstreamA2AURL == "" {
+		problems = append(problems, envUpstreamA2AURL+" is required")
 	}
 	if c.SessionIdleTimeout <= 0 {
 		problems = append(problems, envSessionIdleTimeout+" must be greater than zero")

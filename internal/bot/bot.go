@@ -16,7 +16,7 @@ import (
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
-	"onboarding/internal/agent"
+	"onboarding/internal/a2a"
 	"onboarding/internal/config"
 	"onboarding/internal/state"
 )
@@ -26,7 +26,7 @@ type Bot struct {
 	config   config.Config
 	log      *slog.Logger
 	state    *state.Store
-	agent    *agent.Client
+	upstream *a2a.Client
 	users    *userDirectory
 	sessions *sessionManager
 
@@ -75,19 +75,19 @@ func (b *Bot) Run(ctx context.Context) error {
 		return err
 	}
 
-	a2aClient, err := agent.New(ctx, b.config.A2AAgentURL)
+	upstreamClient, err := a2a.New(ctx, b.config.UpstreamA2AURL)
 	if err != nil {
-		return fmt.Errorf("connect to A2A agent: %w", err)
+		return fmt.Errorf("connect to upstream A2A endpoint: %w", err)
 	}
-	b.agent = a2aClient
+	b.upstream = upstreamClient
 
 	go b.runSessionReaper(ctx)
 
-	b.log.Info("starting onboarding bot",
+	b.log.Info("starting onboarding-agent Matrix runtime",
 		"user_id", b.client.UserID.String(),
 		"homeserver", b.client.HomeserverURL.String(),
 		"state_path", b.config.StatePath,
-		"a2a_agent_url", b.config.A2AAgentURL,
+		"upstream_a2a_url", b.config.UpstreamA2AURL,
 		"session_idle_timeout", b.config.SessionIdleTimeout.String(),
 	)
 
@@ -126,7 +126,7 @@ func (b *Bot) loginWithPassword(ctx context.Context) error {
 			User: usernameForLogin(b.config.Username),
 		},
 		Password:                 b.config.Password,
-		InitialDeviceDisplayName: "onboarding-bot",
+		InitialDeviceDisplayName: "onboarding-agent",
 		StoreCredentials:         true,
 	}
 	if b.client.DeviceID != "" {
@@ -249,7 +249,7 @@ func (b *Bot) handleMessageEvent(ctx context.Context, evt *event.Event) {
 		b.cancelSession(ctx, expired)
 	}
 
-	req := agent.Request{
+	req := a2a.Request{
 		Text:      body,
 		ContextID: record.ContextID,
 		Metadata:  requestMetadata(evt.RoomID, userID, conversationMode(record), "message"),
@@ -261,9 +261,9 @@ func (b *Bot) handleMessageEvent(ctx context.Context, evt *event.Event) {
 		}
 	}
 
-	reply, err := b.agent.Send(ctx, req)
+	reply, err := b.upstream.Send(ctx, req)
 	if err != nil {
-		b.log.Error("failed to route message through A2A",
+		b.log.Error("failed to route message through upstream A2A",
 			"room_id", evt.RoomID.String(),
 			"user_id", userID.String(),
 			"event_id", evt.ID.String(),
@@ -277,7 +277,7 @@ func (b *Bot) handleMessageEvent(ctx context.Context, evt *event.Event) {
 
 	replyBody := b.renderReply(reply)
 	if replyBody == "" {
-		replyBody = "I'm still here, but I didn't get a usable reply from the agent endpoint."
+		replyBody = "I'm still here, but I didn't get a usable reply from the upstream A2A endpoint."
 	}
 	if err := b.sendText(ctx, evt.RoomID, stableTransactionID("message-reply", evt.ID.String()), replyBody); err != nil {
 		b.log.Error("failed to send chat reply",
@@ -302,11 +302,11 @@ func (b *Bot) handleMessageEvent(ctx context.Context, evt *event.Event) {
 	_ = b.markHandledEvent(evt.ID.String(), "message")
 }
 
-func (b *Bot) renderReply(reply agent.Response) string {
+func (b *Bot) renderReply(reply a2a.Response) string {
 	return strings.TrimSpace(reply.Reply)
 }
 
-func (b *Bot) persistReplyState(ctx context.Context, roomID id.RoomID, userID id.UserID, record userRecord, reply agent.Response, now time.Time) error {
+func (b *Bot) persistReplyState(ctx context.Context, roomID id.RoomID, userID id.UserID, record userRecord, reply a2a.Response, now time.Time) error {
 	updated := record
 	changed := false
 
@@ -372,7 +372,7 @@ func (b *Bot) cancelSession(ctx context.Context, current session) {
 	if current.TaskID == "" {
 		return
 	}
-	if err := b.agent.CancelTask(ctx, current.TaskID); err != nil {
+	if err := b.upstream.CancelTask(ctx, current.TaskID); err != nil {
 		b.log.Warn("failed to cancel expired A2A task",
 			"room_id", current.RoomID.String(),
 			"user_id", current.UserID.String(),

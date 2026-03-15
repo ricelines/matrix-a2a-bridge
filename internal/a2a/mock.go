@@ -1,4 +1,4 @@
-package agent
+package a2a
 
 import (
 	"context"
@@ -14,7 +14,7 @@ import (
 	"github.com/a2aproject/a2a-go/a2asrv/eventqueue"
 )
 
-const mockAgentEndpointPath = "/rpc"
+const mockA2AEndpointPath = "/rpc"
 
 type MockServer struct {
 	mu           sync.Mutex
@@ -55,7 +55,7 @@ func newMockHandler(mock *MockServer) http.Handler {
 	mux.HandleFunc(a2asrv.WellKnownAgentCardPath, func(w http.ResponseWriter, r *http.Request) {
 		a2asrv.NewStaticAgentCardHandler(mock.agentCard(requestBaseURL(r))).ServeHTTP(w, r)
 	})
-	mux.Handle(mockAgentEndpointPath, a2asrv.NewJSONRPCHandler(reqHandler))
+	mux.Handle(mockA2AEndpointPath, a2asrv.NewJSONRPCHandler(reqHandler))
 	return mux
 }
 
@@ -102,10 +102,10 @@ func (m *MockServer) WasTaskCanceled(taskID string) bool {
 
 func (m *MockServer) agentCard(baseURL string) *a2aproto.AgentCard {
 	return &a2aproto.AgentCard{
-		Name:               "Mock Ricelines A2A Agent",
-		Description:        "Mock onboarding agent used by the Matrix onboarding bot tests.",
+		Name:               "Mock Upstream A2A Agent",
+		Description:        "Mock upstream A2A endpoint used by onboarding-agent's Matrix runtime tests.",
 		Version:            "test",
-		URL:                baseURL + mockAgentEndpointPath,
+		URL:                baseURL + mockA2AEndpointPath,
 		ProtocolVersion:    string(a2aproto.Version),
 		PreferredTransport: a2aproto.TransportProtocolJSONRPC,
 		Capabilities: a2aproto.AgentCapabilities{
@@ -116,7 +116,7 @@ func (m *MockServer) agentCard(baseURL string) *a2aproto.AgentCard {
 		AdditionalInterfaces: []a2aproto.AgentInterface{
 			{
 				Transport: a2aproto.TransportProtocolJSONRPC,
-				URL:       baseURL + mockAgentEndpointPath,
+				URL:       baseURL + mockA2AEndpointPath,
 			},
 		},
 		Skills: []a2aproto.AgentSkill{},

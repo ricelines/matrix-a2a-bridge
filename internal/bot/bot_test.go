@@ -19,7 +19,7 @@ import (
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
-	"onboarding/internal/agent"
+	"onboarding/internal/a2a"
 	"onboarding/internal/state"
 )
 
@@ -32,7 +32,7 @@ func TestPersistReplyStateStoresOnlyInterruptibleTasks(t *testing.T) {
 
 	t.Run("working task is not cached for reuse", func(t *testing.T) {
 		bot := &Bot{sessions: newSessionManager(time.Minute)}
-		err := bot.persistReplyState(context.Background(), roomID, userID, userRecord{ContextID: "ctx"}, agent.Response{
+		err := bot.persistReplyState(context.Background(), roomID, userID, userRecord{ContextID: "ctx"}, a2a.Response{
 			TaskID:    "task-working",
 			ContextID: "ctx",
 			State:     a2aproto.TaskStateWorking,
@@ -48,7 +48,7 @@ func TestPersistReplyStateStoresOnlyInterruptibleTasks(t *testing.T) {
 
 	t.Run("input required task remains cached", func(t *testing.T) {
 		bot := &Bot{sessions: newSessionManager(time.Minute)}
-		err := bot.persistReplyState(context.Background(), roomID, userID, userRecord{ContextID: "ctx"}, agent.Response{
+		err := bot.persistReplyState(context.Background(), roomID, userID, userRecord{ContextID: "ctx"}, a2a.Response{
 			TaskID:    "task-input",
 			ContextID: "ctx",
 			State:     a2aproto.TaskStateInputRequired,
@@ -198,9 +198,9 @@ func TestHandleMessageEventWaitsForUsableReplyAndDoesNotReuseCompletedTask(t *te
 		t.Fatalf("NewClient() error = %v", err)
 	}
 
-	agentClient, err := agent.New(context.Background(), a2aServer.URL)
+	upstreamClient, err := a2a.New(context.Background(), a2aServer.URL)
 	if err != nil {
-		t.Fatalf("agent.New() error = %v", err)
+		t.Fatalf("a2a.New() error = %v", err)
 	}
 
 	stateStore, err := state.Open(path.Join(t.TempDir(), "bot-state.json"))
@@ -212,7 +212,7 @@ func TestHandleMessageEventWaitsForUsableReplyAndDoesNotReuseCompletedTask(t *te
 		client:   client,
 		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 		state:    stateStore,
-		agent:    agentClient,
+		upstream: upstreamClient,
 		users:    newUserDirectory(client),
 		sessions: newSessionManager(time.Minute),
 		roomPeers: map[id.RoomID]id.UserID{
@@ -432,7 +432,7 @@ func writeJSONRPCResponse(t *testing.T, w http.ResponseWriter, id any, result an
 func testAgentCard(baseURL string) *a2aproto.AgentCard {
 	return &a2aproto.AgentCard{
 		Name:               "Test Agent",
-		Description:        "Test agent for onboarding bot regression coverage.",
+		Description:        "Test upstream A2A endpoint for onboarding-agent regression coverage.",
 		Version:            "test",
 		URL:                baseURL + testAgentEndpointPath,
 		ProtocolVersion:    string(a2aproto.Version),

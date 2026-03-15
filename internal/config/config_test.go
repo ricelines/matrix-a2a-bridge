@@ -12,7 +12,7 @@ func TestValidateAcceptsPasswordAuth(t *testing.T) {
 		Username:           "bot",
 		Password:           "secret",
 		StatePath:          "data/state.json",
-		A2AAgentURL:        "http://127.0.0.1:9999",
+		UpstreamA2AURL:     "http://127.0.0.1:9999",
 		SessionIdleTimeout: 5 * time.Minute,
 	}
 
@@ -26,7 +26,7 @@ func TestValidateRejectsIncompleteAuth(t *testing.T) {
 		HomeserverURL:      "https://matrix.example.com",
 		Username:           "bot",
 		StatePath:          "data/state.json",
-		A2AAgentURL:        "http://127.0.0.1:9999",
+		UpstreamA2AURL:     "http://127.0.0.1:9999",
 		SessionIdleTimeout: 5 * time.Minute,
 	}
 
@@ -53,8 +53,8 @@ func TestValidateRequiresA2AURLAndPositiveIdleTimeout(t *testing.T) {
 		t.Fatal("Validate() succeeded without an A2A URL and idle timeout")
 	}
 
-	if !strings.Contains(err.Error(), envA2AAgentURL) {
-		t.Fatalf("Validate() error = %v, want mention of %s", err, envA2AAgentURL)
+	if !strings.Contains(err.Error(), envUpstreamA2AURL) {
+		t.Fatalf("Validate() error = %v, want mention of %s", err, envUpstreamA2AURL)
 	}
 	if !strings.Contains(err.Error(), envSessionIdleTimeout) {
 		t.Fatalf("Validate() error = %v, want mention of %s", err, envSessionIdleTimeout)

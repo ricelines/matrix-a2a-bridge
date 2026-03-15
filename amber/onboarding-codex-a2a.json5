@@ -4,31 +4,26 @@
     type: "object",
     properties: {
       auth_json: { type: "string", secret: true },
-      agents_md: { type: "string" },
       matrix_username: { type: "string" },
       matrix_password: { type: "string", secret: true },
-      bot_session_idle_timeout: { type: "string" },
+      bot_session_idle_timeout: { type: "string", default: "10m" },
     },
-    required: [
-      "auth_json",
-      "matrix_username",
-      "matrix_password",
-      "bot_session_idle_timeout",
-    ],
+    required: ["matrix_username", "matrix_password"],
     additionalProperties: false,
   },
   slots: {
     matrix: { kind: "http" },
   },
   components: {
-    agent: {
+    codex_agent: {
       manifest: "https://raw.githubusercontent.com/ricelines/codex-a2a/refs/heads/main/amber.json5",
       config: {
         auth_json: "${config.auth_json}",
-        agents_md: "${config.agents_md}",
+        model: "gpt-5.4",
+        model_reasoning_effort: "low",
       },
     },
-    bot: {
+    onboarding_agent: {
       manifest: "./onboarding-agent.json5",
       config: {
         matrix_username: "${config.matrix_username}",
@@ -38,7 +33,7 @@
     },
   },
   bindings: [
-    { to: "#bot.matrix", from: "self.matrix", weak: true },
-    { to: "#bot.agent", from: "#agent.a2a" },
+    { to: "#onboarding_agent.matrix", from: "self.matrix", weak: true },
+    { to: "#onboarding_agent.upstream_a2a", from: "#codex_agent.a2a" },
   ],
 }

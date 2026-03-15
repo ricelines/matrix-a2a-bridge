@@ -8,7 +8,7 @@
     },
   },
   provides: {
-    agent: { kind: "a2a", endpoint: "a2a" },
+    a2a: { kind: "a2a", endpoint: "a2a" },
   },
-  exports: { agent: "agent" },
+  exports: { a2a: "a2a" },
 }

@@ -20,7 +20,7 @@ import (
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
-	"onboarding/internal/agent"
+	"onboarding/internal/a2a"
 	botpkg "onboarding/internal/bot"
 	"onboarding/internal/config"
 	"onboarding/internal/state"
@@ -83,27 +83,27 @@ func TestBotStartsNewTaskAfterIdleTimeout(t *testing.T) {
 	harness.alice.waitForMessageContaining(t, roomID, harness.botUserID, "I can keep this DM connected to an A2A task, preserve shared context, and continue the conversation naturally.", 20*time.Second)
 
 	waitForCondition(t, 10*time.Second, func() bool {
-		return harness.agent.TaskCountForRoom(roomID.String()) == 2
+		return harness.upstream.TaskCountForRoom(roomID.String()) == 2
 	}, "first post-onboarding task was not created")
 
-	taskIDs := harness.agent.TaskIDsForRoom(roomID.String())
+	taskIDs := harness.upstream.TaskIDsForRoom(roomID.String())
 	if len(taskIDs) != 2 {
 		t.Fatalf("unexpected task IDs after first post-onboarding message: %v", taskIDs)
 	}
 	firstGeneralTaskID := taskIDs[1]
 
 	waitForCondition(t, harness.sessionIdleTimeout+5*time.Second, func() bool {
-		return harness.agent.WasTaskCanceled(firstGeneralTaskID)
+		return harness.upstream.WasTaskCanceled(firstGeneralTaskID)
 	}, "idle session task was not canceled")
 
 	harness.alice.sendText(t, roomID, "status please")
 	harness.alice.waitForMessageContaining(t, roomID, harness.botUserID, "Your onboarding record is set, and this conversation is using the shared A2A context.", 20*time.Second)
 
 	waitForCondition(t, 10*time.Second, func() bool {
-		return harness.agent.TaskCountForRoom(roomID.String()) == 3
+		return harness.upstream.TaskCountForRoom(roomID.String()) == 3
 	}, "second post-idle task was not created")
 
-	if got := harness.agent.ContextCountForUser(harness.aliceUserID.String()); got != 1 {
+	if got := harness.upstream.ContextCountForUser(harness.aliceUserID.String()); got != 1 {
 		t.Fatalf("ContextCountForUser() = %d, want 1 shared context", got)
 	}
 }
@@ -111,7 +111,7 @@ func TestBotStartsNewTaskAfterIdleTimeout(t *testing.T) {
 type liveHarness struct {
 	t                  *testing.T
 	server             *tuwunelContainer
-	agent              *agent.MockServer
+	upstream           *a2a.MockServer
 	alice              *syncingClient
 	botRun             *runningBot
 	botLog             *bytes.Buffer
@@ -127,15 +127,15 @@ func newLiveHarness(t *testing.T) *liveHarness {
 	requireDocker(t)
 
 	server := newTuwunelContainer(t)
-	agentServer := agent.StartMockServer()
+	upstreamServer := a2a.StartMockServer()
 	alice := newSyncingClient(t, server.baseURL(), aliceUser, alicePassword)
 
-	t.Cleanup(agentServer.Close)
+	t.Cleanup(upstreamServer.Close)
 
 	return &liveHarness{
 		t:                  t,
 		server:             server,
-		agent:              agentServer,
+		upstream:           upstreamServer,
 		alice:              alice,
 		botLog:             &bytes.Buffer{},
 		statePath:          filepath.Join(server.tempDir, "bot-state.json"),
@@ -160,7 +160,7 @@ func (h *liveHarness) startBot(t *testing.T) {
 		Username:           botUser,
 		Password:           botPassword,
 		StatePath:          h.statePath,
-		A2AAgentURL:        h.agent.BaseURL(),
+		UpstreamA2AURL:     h.upstream.BaseURL(),
 		SessionIdleTimeout: h.sessionIdleTimeout,
 	}
 	matrixBot, err := botpkg.New(cfg, slog.New(slog.NewTextHandler(h.botLog, nil)))

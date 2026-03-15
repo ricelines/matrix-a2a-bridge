@@ -1,4 +1,4 @@
-package agent
+package a2a
 
 import (
 	"context"
@@ -71,7 +71,7 @@ func TestClientSendWaitsForUsableReplyAfterWorkingTask(t *testing.T) {
 		case a2asrv.WellKnownAgentCardPath:
 			a2asrv.NewStaticAgentCardHandler(testAgentCard(serverBaseURL(r))).ServeHTTP(w, r)
 			return
-		case mockAgentEndpointPath:
+		case mockA2AEndpointPath:
 		default:
 			http.NotFound(w, r)
 			return
@@ -194,9 +194,9 @@ func writeJSONRPCResponse(t *testing.T, w http.ResponseWriter, id any, result an
 func testAgentCard(baseURL string) *a2aproto.AgentCard {
 	return &a2aproto.AgentCard{
 		Name:               "Test Agent",
-		Description:        "Test agent for onboarding client regression coverage.",
+		Description:        "Test upstream A2A endpoint for onboarding-agent regression coverage.",
 		Version:            "test",
-		URL:                baseURL + mockAgentEndpointPath,
+		URL:                baseURL + mockA2AEndpointPath,
 		ProtocolVersion:    string(a2aproto.Version),
 		PreferredTransport: a2aproto.TransportProtocolJSONRPC,
 		Capabilities:       a2aproto.AgentCapabilities{Streaming: false},
@@ -204,7 +204,7 @@ func testAgentCard(baseURL string) *a2aproto.AgentCard {
 		DefaultOutputModes: []string{"text/plain"},
 		AdditionalInterfaces: []a2aproto.AgentInterface{{
 			Transport: a2aproto.TransportProtocolJSONRPC,
-			URL:       baseURL + mockAgentEndpointPath,
+			URL:       baseURL + mockA2AEndpointPath,
 		}},
 	}
 }

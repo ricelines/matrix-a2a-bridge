@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"os"
 
-	"onboarding/internal/agent"
+	"onboarding/internal/a2a"
 )
 
 func main() {
@@ -16,7 +16,7 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	server := &http.Server{
 		Addr:    *listenAddr,
-		Handler: agent.NewMockHTTPHandler(),
+		Handler: a2a.NewMockHTTPHandler(),
 	}
 
 	logger.Info("starting mock A2A server", "addr", *listenAddr)

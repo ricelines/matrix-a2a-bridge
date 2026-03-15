@@ -1,4 +1,4 @@
-package agent
+package a2a
 
 import (
 	"context"
@@ -32,7 +32,7 @@ type Client struct {
 func New(ctx context.Context, baseURL string) (*Client, error) {
 	card, err := agentcard.DefaultResolver.Resolve(ctx, baseURL)
 	if err != nil {
-		return nil, fmt.Errorf("resolve agent card: %w", err)
+		return nil, fmt.Errorf("resolve upstream A2A agent card: %w", err)
 	}
 
 	client, err := a2aclient.NewFromCard(ctx, card)
@@ -66,7 +66,7 @@ func (c *Client) Send(ctx context.Context, req Request) (Response, error) {
 			break
 		}
 		if req.TaskID == "" {
-			return Response{}, fmt.Errorf("send message: %w", err)
+			return Response{}, fmt.Errorf("send upstream A2A message: %w", err)
 		}
 
 		select {
@@ -76,7 +76,7 @@ func (c *Client) Send(ctx context.Context, req Request) (Response, error) {
 		}
 	}
 	if err != nil {
-		return Response{}, fmt.Errorf("send message: %w", err)
+		return Response{}, fmt.Errorf("send upstream A2A message: %w", err)
 	}
 
 	response, err := normalizeResult(result)

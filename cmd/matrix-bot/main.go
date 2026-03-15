@@ -20,17 +20,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	matrixBot, err := bot.New(cfg, logger)
+	matrixRuntime, err := bot.New(cfg, logger)
 	if err != nil {
-		logger.Error("failed to create bot", "err", err)
+		logger.Error("failed to create onboarding-agent Matrix runtime", "err", err)
 		os.Exit(1)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := matrixBot.Run(ctx); err != nil {
-		logger.Error("bot stopped with error", "err", err)
+	if err := matrixRuntime.Run(ctx); err != nil {
+		logger.Error("onboarding-agent Matrix runtime stopped with error", "err", err)
 		os.Exit(1)
 	}
 }

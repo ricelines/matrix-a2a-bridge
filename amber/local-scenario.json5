@@ -4,8 +4,8 @@
     matrix: { kind: "http" },
   },
   components: {
-    agent: "./mock-a2a.json5",
-    bot: {
+    mock_upstream: "./mock-a2a.json5",
+    onboarding_agent: {
       manifest: "./onboarding-agent.json5",
       config: {
         matrix_username: "bot",
@@ -15,7 +15,7 @@
     },
   },
   bindings: [
-    { to: "#bot.matrix", from: "self.matrix", weak: true },
-    { to: "#bot.agent", from: "#agent.agent" },
+    { to: "#onboarding_agent.matrix", from: "self.matrix", weak: true },
+    { to: "#onboarding_agent.upstream_a2a", from: "#mock_upstream.a2a" },
   ],
 }
