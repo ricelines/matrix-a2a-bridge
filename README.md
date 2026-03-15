@@ -34,6 +34,31 @@ The upstream response is expected to contain:
 
 `internal/a2a/mock.go` provides the mock upstream A2A server used by the tests and the local Amber demo.
 
+## CI and image publishing
+
+GitHub Actions includes:
+
+- `ci`: runs `gofmt`, `go vet`, and `go test ./...` on `main` and on pull requests
+- `docker`: builds the Docker image on `main` and on pull requests, and pushes to `ghcr.io/<repo-owner>/matrix-a2a-bridge` on `main`
+
+Both workflows use dependency and BuildKit caches, and cancel superseded runs on the same ref.
+
+Image versioning is driven by `version-series.txt`.
+
+Examples:
+
+- `0.1.x` publishes `v0.1.0`, `v0.1.1`, ...
+- `1.2.x` publishes `v1.2.0`, `v1.2.1`, ... and updates `v1.2` plus `v1`
+- `1.0.0-alpha.x` publishes `v1.0.0-alpha.0`, `v1.0.0-alpha.1`, ... and updates `v1.0.0.alpha`
+
+On each `main` push, CI checks GHCR for the next unused `x` value in the configured series, then publishes:
+
+- `latest`
+- the fully resolved version tag
+- the appropriate floating semver tag or tags for that series
+
+Pull requests build the image but do not publish tags.
+
 ## Configuration
 
 Required:

@@ -453,8 +453,6 @@ func newLoggedInClient(t *testing.T, homeserverURL, username, password string) *
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-
-	return client
 }
 
 func userBucketEventType(userID id.UserID) string {
