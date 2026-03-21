@@ -6,7 +6,6 @@
       auth_json: { type: "string", secret: true },
       matrix_username: { type: "string" },
       matrix_password: { type: "string", secret: true },
-      bot_session_idle_timeout: { type: "string", default: "10m" },
     },
     required: ["matrix_username", "matrix_password"],
     additionalProperties: false,
@@ -28,7 +27,6 @@
       config: {
         matrix_username: "${config.matrix_username}",
         matrix_password: "${config.matrix_password}",
-        bot_session_idle_timeout: "${config.bot_session_idle_timeout}",
       },
     },
   },

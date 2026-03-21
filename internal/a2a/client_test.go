@@ -7,66 +7,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 
 	a2aproto "github.com/a2aproject/a2a-go/a2a"
 	"github.com/a2aproject/a2a-go/a2asrv"
 )
 
-func TestResponseReady(t *testing.T) {
-	tests := []struct {
-		name string
-		resp Response
-		want bool
-	}{
-		{
-			name: "submitted without reply keeps polling",
-			resp: Response{State: a2aproto.TaskStateSubmitted},
-			want: false,
-		},
-		{
-			name: "working without reply keeps polling",
-			resp: Response{State: a2aproto.TaskStateWorking},
-			want: false,
-		},
-		{
-			name: "working with reply returns",
-			resp: Response{State: a2aproto.TaskStateWorking, Reply: "partial"},
-			want: true,
-		},
-		{
-			name: "input required without reply returns",
-			resp: Response{State: a2aproto.TaskStateInputRequired},
-			want: true,
-		},
-		{
-			name: "terminal without reply returns",
-			resp: Response{State: a2aproto.TaskStateCompleted},
-			want: true,
-		},
-	}
+func TestClientDeliverSendsNonBlockingNotification(t *testing.T) {
+	const body = `{"kind":"matrix_event"}`
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := responseReady(tt.resp); got != tt.want {
-				t.Fatalf("responseReady(%+v) = %t, want %t", tt.resp, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestClientSendWaitsForUsableReplyAfterWorkingTask(t *testing.T) {
-	const (
-		taskID    = "task-123"
-		contextID = "ctx-123"
-		replyText = "ready"
-	)
-
-	var (
-		mu           sync.Mutex
-		getTaskCalls int
-	)
+	var gotMetadata map[string]any
 
 	server := newLocalServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -86,48 +36,22 @@ func TestClientSendWaitsForUsableReplyAfterWorkingTask(t *testing.T) {
 			if err := json.Unmarshal(req.Params, &params); err != nil {
 				t.Fatalf("Unmarshal(message/send params) error = %v", err)
 			}
-			if params.Config == nil || params.Config.Blocking == nil || !*params.Config.Blocking {
-				t.Fatalf("message/send blocking = %#v, want true", params.Config)
+			if params.Config == nil || params.Config.Blocking == nil || *params.Config.Blocking {
+				t.Fatalf("message/send blocking = %#v, want false", params.Config)
 			}
+
+			if got := currentUserText(params.Message); got != body {
+				t.Fatalf("message/send body = %q, want %q", got, body)
+			}
+			gotMetadata = params.Metadata
 
 			writeJSONRPCResponse(t, w, req.ID, map[string]any{
-				"kind":      "task",
-				"id":        taskID,
-				"contextId": contextID,
+				"kind": "task",
+				"id":   "task-123",
 				"status": map[string]any{
-					"state": "working",
+					"state": "submitted",
 				},
 			})
-		case "tasks/get":
-			mu.Lock()
-			getTaskCalls++
-			callNumber := getTaskCalls
-			mu.Unlock()
-
-			result := map[string]any{
-				"kind":      "task",
-				"id":        taskID,
-				"contextId": contextID,
-				"status": map[string]any{
-					"state": "working",
-				},
-			}
-			if callNumber >= 3 {
-				result["status"] = map[string]any{
-					"state": "completed",
-					"message": map[string]any{
-						"kind":      "message",
-						"messageId": "msg-123",
-						"role":      "agent",
-						"parts": []map[string]any{{
-							"kind": "text",
-							"text": replyText,
-						}},
-					},
-				}
-			}
-
-			writeJSONRPCResponse(t, w, req.ID, result)
 		default:
 			t.Fatalf("unexpected JSON-RPC method %q", req.Method)
 		}
@@ -138,25 +62,30 @@ func TestClientSendWaitsForUsableReplyAfterWorkingTask(t *testing.T) {
 		t.Fatalf("New() error = %v", err)
 	}
 
-	resp, err := client.Send(context.Background(), Request{Text: "hello"})
+	err = client.Deliver(context.Background(), Notification{
+		Body: body,
+		Metadata: map[string]any{
+			"matrix_event": map[string]any{
+				"kind": "matrix_event",
+			},
+		},
+	})
 	if err != nil {
-		t.Fatalf("Send() error = %v", err)
-	}
-	if resp.TaskID != taskID || resp.ContextID != contextID {
-		t.Fatalf("response identity = (%q, %q), want (%q, %q)", resp.TaskID, resp.ContextID, taskID, contextID)
-	}
-	if resp.State != a2aproto.TaskStateCompleted {
-		t.Fatalf("resp.State = %s, want %s", resp.State, a2aproto.TaskStateCompleted)
-	}
-	if resp.Reply != replyText {
-		t.Fatalf("resp.Reply = %q, want %q", resp.Reply, replyText)
+		t.Fatalf("Deliver() error = %v", err)
 	}
 
-	mu.Lock()
-	calls := getTaskCalls
-	mu.Unlock()
-	if calls < 3 {
-		t.Fatalf("GetTask was called %d times, want at least 3 polls before completion", calls)
+	matrixEvent, ok := gotMetadata["matrix_event"].(map[string]any)
+	if !ok || matrixEvent["kind"] != "matrix_event" {
+		t.Fatalf("metadata = %#v, want matrix_event.kind", gotMetadata)
+	}
+}
+
+func TestClientDeliverRejectsEmptyBody(t *testing.T) {
+	client := &Client{}
+
+	err := client.Deliver(context.Background(), Notification{Body: " \n\t "})
+	if err == nil || !strings.Contains(err.Error(), "must not be empty") {
+		t.Fatalf("Deliver() error = %v, want empty body validation", err)
 	}
 }
 

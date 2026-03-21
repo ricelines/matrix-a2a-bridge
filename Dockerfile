@@ -27,7 +27,7 @@ RUN --mount=type=cache,target=/go/pkg/mod,sharing=locked \
         -trimpath \
         -ldflags='-s -w' \
         -o /out/matrix-a2a-bridge \
-        ./cmd/matrix-bot && \
+        ./cmd/matrix-a2a-bridge && \
     go build \
         -buildvcs=false \
         -trimpath \

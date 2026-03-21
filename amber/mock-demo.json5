@@ -10,7 +10,6 @@
       config: {
         matrix_username: "bot",
         matrix_password: "bot-password",
-        bot_session_idle_timeout: "2s",
       },
     },
   },

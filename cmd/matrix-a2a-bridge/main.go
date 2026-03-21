@@ -7,7 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"matrix-a2a-bridge/internal/bot"
+	"matrix-a2a-bridge/internal/bridge"
 	"matrix-a2a-bridge/internal/config"
 )
 
@@ -20,7 +20,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	matrixRuntime, err := bot.New(cfg, logger)
+	matrixBridge, err := bridge.New(cfg, logger)
 	if err != nil {
 		logger.Error("failed to create Matrix A2A bridge runtime", "err", err)
 		os.Exit(1)
@@ -29,7 +29,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := matrixRuntime.Run(ctx); err != nil {
+	if err := matrixBridge.Run(ctx); err != nil {
 		logger.Error("Matrix A2A bridge runtime stopped with error", "err", err)
 		os.Exit(1)
 	}

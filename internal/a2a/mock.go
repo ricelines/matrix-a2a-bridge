@@ -6,8 +6,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"slices"
-	"strings"
 	"sync"
 
 	a2aproto "github.com/a2aproject/a2a-go/a2a"
@@ -17,17 +15,15 @@ import (
 
 const mockA2AEndpointPath = "/rpc"
 
-type MockServer struct {
-	mu           sync.Mutex
-	server       *httptest.Server
-	roomTaskIDs  map[string][]string
-	userContexts map[string]map[string]struct{}
-	canceled     []string
+type RecordedNotification struct {
+	Body     string
+	Metadata map[string]any
 }
 
-type responsePlan struct {
-	State a2aproto.TaskState
-	Reply string
+type MockServer struct {
+	mu            sync.Mutex
+	server        *httptest.Server
+	notifications []RecordedNotification
 }
 
 func StartMockServer() *MockServer {
@@ -51,11 +47,7 @@ func NewMockHTTPHandler() http.Handler {
 }
 
 func newMockServer() *MockServer {
-	mock := &MockServer{
-		roomTaskIDs:  make(map[string][]string),
-		userContexts: make(map[string]map[string]struct{}),
-	}
-	return mock
+	return &MockServer{}
 }
 
 func newMockHandler(mock *MockServer) http.Handler {
@@ -81,32 +73,20 @@ func (m *MockServer) BaseURL() string {
 	return m.server.URL
 }
 
-func (m *MockServer) TaskCountForRoom(roomID string) int {
+func (m *MockServer) Notifications() []RecordedNotification {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	return len(m.roomTaskIDs[roomID])
+	out := make([]RecordedNotification, len(m.notifications))
+	copy(out, m.notifications)
+	return out
 }
 
-func (m *MockServer) TaskIDsForRoom(roomID string) []string {
+func (m *MockServer) NotificationCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	return append([]string(nil), m.roomTaskIDs[roomID]...)
-}
-
-func (m *MockServer) ContextCountForUser(userID string) int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	return len(m.userContexts[userID])
-}
-
-func (m *MockServer) WasTaskCanceled(taskID string) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	return slices.Contains(m.canceled, taskID)
+	return len(m.notifications)
 }
 
 func (m *MockServer) agentCard(baseURL string) *a2aproto.AgentCard {
@@ -128,7 +108,6 @@ func (m *MockServer) agentCard(baseURL string) *a2aproto.AgentCard {
 				URL:       baseURL + mockA2AEndpointPath,
 			},
 		},
-		Skills: []a2aproto.AgentSkill{},
 	}
 }
 
@@ -141,26 +120,25 @@ func requestBaseURL(r *http.Request) string {
 }
 
 func (m *MockServer) recordExecution(reqCtx *a2asrv.RequestContext) {
-	roomID, userID := matrixMetadata(reqCtx.Metadata)
-	if roomID == "" || userID == "" {
-		return
-	}
-
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.roomTaskIDs[roomID] = append(m.roomTaskIDs[roomID], string(reqCtx.TaskID))
-	if _, ok := m.userContexts[userID]; !ok {
-		m.userContexts[userID] = make(map[string]struct{})
-	}
-	m.userContexts[userID][reqCtx.ContextID] = struct{}{}
+	m.notifications = append(m.notifications, RecordedNotification{
+		Body:     currentUserText(reqCtx.Message),
+		Metadata: cloneMetadata(reqCtx.Metadata),
+	})
 }
 
-func (m *MockServer) recordCancel(taskID string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+func cloneMetadata(input map[string]any) map[string]any {
+	if input == nil {
+		return nil
+	}
 
-	m.canceled = append(m.canceled, taskID)
+	out := make(map[string]any, len(input))
+	for key, value := range input {
+		out[key] = value
+	}
+	return out
 }
 
 type mockExecutor struct {
@@ -170,15 +148,15 @@ type mockExecutor struct {
 func (e *mockExecutor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, queue eventqueue.Queue) error {
 	if reqCtx.StoredTask == nil {
 		e.mock.recordExecution(reqCtx)
-		if err := queue.Write(ctx, a2aproto.NewSubmittedTask(reqCtx, reqCtx.Message)); err != nil {
-			return fmt.Errorf("write submitted task: %w", err)
-		}
 	}
 
-	plan := buildPlan(reqCtx)
-	statusMessage := buildStatusMessage(reqCtx, plan)
-	update := a2aproto.NewStatusUpdateEvent(reqCtx, plan.State, statusMessage)
-	update.Final = plan.State.Terminal() || plan.State == a2aproto.TaskStateInputRequired
+	msg := a2aproto.NewMessageForTask(
+		a2aproto.MessageRoleAgent,
+		reqCtx,
+		a2aproto.TextPart{Text: "received"},
+	)
+	update := a2aproto.NewStatusUpdateEvent(reqCtx, a2aproto.TaskStateCompleted, msg)
+	update.Final = true
 
 	if err := queue.Write(ctx, update); err != nil {
 		return fmt.Errorf("write status update: %w", err)
@@ -186,63 +164,8 @@ func (e *mockExecutor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContex
 	return nil
 }
 
-func (e *mockExecutor) Cancel(ctx context.Context, reqCtx *a2asrv.RequestContext, queue eventqueue.Queue) error {
-	e.mock.recordCancel(string(reqCtx.TaskID))
-
-	msg := buildAgentMessage(reqCtx, "I'll close this task here. Message me again when you're ready to continue.")
-	update := a2aproto.NewStatusUpdateEvent(reqCtx, a2aproto.TaskStateCanceled, msg)
-	update.Final = true
-
-	if err := queue.Write(ctx, update); err != nil {
-		return fmt.Errorf("write cancel status: %w", err)
-	}
+func (e *mockExecutor) Cancel(context.Context, *a2asrv.RequestContext, eventqueue.Queue) error {
 	return nil
-}
-
-func buildPlan(reqCtx *a2asrv.RequestContext) responsePlan {
-	text := strings.TrimSpace(currentUserText(reqCtx.Message))
-	intent, hasIntent := parseIntent(text)
-
-	if hasIntent && intent == "close_session" {
-		return responsePlan{
-			State: a2aproto.TaskStateCompleted,
-			Reply: "I'll wrap up this A2A task now.",
-		}
-	}
-	if hasIntent {
-		reply := "I can keep this DM connected to an A2A task, preserve shared context per Matrix user, and continue the conversation naturally."
-		if intent == "status" {
-			reply = "This Matrix DM is connected to an A2A task and reuses the shared context for this Matrix user."
-		}
-		return responsePlan{
-			State: a2aproto.TaskStateInputRequired,
-			Reply: reply,
-		}
-	}
-
-	if reqCtx.StoredTask != nil {
-		return responsePlan{
-			State: a2aproto.TaskStateInputRequired,
-			Reply: "I'm still connected to the same A2A task. Ask for help, ask for status, or tell me to close the task.",
-		}
-	}
-
-	return responsePlan{
-		State: a2aproto.TaskStateInputRequired,
-		Reply: "I received your message over Matrix and opened an A2A task. Ask for help, ask for status, or tell me to close the task.",
-	}
-}
-
-func buildStatusMessage(reqCtx *a2asrv.RequestContext, plan responsePlan) *a2aproto.Message {
-	return buildAgentMessage(reqCtx, plan.Reply)
-}
-
-func buildAgentMessage(reqCtx *a2asrv.RequestContext, reply string) *a2aproto.Message {
-	return a2aproto.NewMessageForTask(
-		a2aproto.MessageRoleAgent,
-		reqCtx,
-		a2aproto.TextPart{Text: reply},
-	)
 }
 
 func currentUserText(msg *a2aproto.Message) string {
@@ -258,30 +181,4 @@ func currentUserText(msg *a2aproto.Message) string {
 		}
 	}
 	return ""
-}
-
-func parseIntent(text string) (string, bool) {
-	normalized := strings.ToLower(strings.TrimSpace(text))
-	switch {
-	case normalized == "":
-		return "", false
-	case strings.Contains(normalized, "status"):
-		return "status", true
-	case strings.Contains(normalized, "help"), strings.Contains(normalized, "what can you do"):
-		return "help", true
-	case strings.Contains(normalized, "close"), strings.Contains(normalized, "done for now"):
-		return "close_session", true
-	default:
-		return "", false
-	}
-}
-
-func matrixMetadata(metadata map[string]any) (roomID string, userID string) {
-	matrix, ok := metadata["matrix"].(map[string]any)
-	if !ok {
-		return "", ""
-	}
-	roomID, _ = matrix["room_id"].(string)
-	userID, _ = matrix["user_id"].(string)
-	return roomID, userID
 }

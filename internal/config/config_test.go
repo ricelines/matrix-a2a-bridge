@@ -3,17 +3,15 @@ package config
 import (
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestValidateAcceptsPasswordAuth(t *testing.T) {
 	cfg := Config{
-		HomeserverURL:      "https://matrix.example.com",
-		Username:           "bot",
-		Password:           "secret",
-		StatePath:          "data/state.json",
-		UpstreamA2AURL:     "http://127.0.0.1:9999",
-		SessionIdleTimeout: 5 * time.Minute,
+		HomeserverURL:  "https://matrix.example.com",
+		Username:       "bot",
+		Password:       "secret",
+		StatePath:      "data/state.json",
+		UpstreamA2AURL: "http://127.0.0.1:9999",
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -23,11 +21,10 @@ func TestValidateAcceptsPasswordAuth(t *testing.T) {
 
 func TestValidateRejectsIncompleteAuth(t *testing.T) {
 	cfg := Config{
-		HomeserverURL:      "https://matrix.example.com",
-		Username:           "bot",
-		StatePath:          "data/state.json",
-		UpstreamA2AURL:     "http://127.0.0.1:9999",
-		SessionIdleTimeout: 5 * time.Minute,
+		HomeserverURL:  "https://matrix.example.com",
+		Username:       "bot",
+		StatePath:      "data/state.json",
+		UpstreamA2AURL: "http://127.0.0.1:9999",
 	}
 
 	err := cfg.Validate()
@@ -39,24 +36,20 @@ func TestValidateRejectsIncompleteAuth(t *testing.T) {
 	}
 }
 
-func TestValidateRequiresA2AURLAndPositiveIdleTimeout(t *testing.T) {
+func TestValidateRequiresA2AURL(t *testing.T) {
 	cfg := Config{
-		HomeserverURL:      "https://matrix.example.com",
-		Username:           "bot",
-		Password:           "secret",
-		StatePath:          "data/state.json",
-		SessionIdleTimeout: 0,
+		HomeserverURL: "https://matrix.example.com",
+		Username:      "bot",
+		Password:      "secret",
+		StatePath:     "data/state.json",
 	}
 
 	err := cfg.Validate()
 	if err == nil {
-		t.Fatal("Validate() succeeded without an A2A URL and idle timeout")
+		t.Fatal("Validate() succeeded without an A2A URL")
 	}
 
 	if !strings.Contains(err.Error(), envUpstreamA2AURL) {
 		t.Fatalf("Validate() error = %v, want mention of %s", err, envUpstreamA2AURL)
-	}
-	if !strings.Contains(err.Error(), envSessionIdleTimeout) {
-		t.Fatalf("Validate() error = %v, want mention of %s", err, envSessionIdleTimeout)
 	}
 }

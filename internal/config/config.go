@@ -2,31 +2,26 @@ package config
 
 import (
 	"errors"
-	"fmt"
 	"os"
 	"strings"
-	"time"
 )
 
 const (
-	defaultStatePath          = "data/state.json"
-	defaultSessionIdleTimeout = 10 * time.Minute
+	defaultStatePath = "data/state.json"
 
-	envHomeserverURL      = "MATRIX_HOMESERVER_URL"
-	envUsername           = "MATRIX_USERNAME"
-	envPassword           = "MATRIX_PASSWORD"
-	envStatePath          = "MATRIX_STATE_PATH"
-	envUpstreamA2AURL     = "UPSTREAM_A2A_URL"
-	envSessionIdleTimeout = "BOT_SESSION_IDLE_TIMEOUT"
+	envHomeserverURL  = "MATRIX_HOMESERVER_URL"
+	envUsername       = "MATRIX_USERNAME"
+	envPassword       = "MATRIX_PASSWORD"
+	envStatePath      = "MATRIX_STATE_PATH"
+	envUpstreamA2AURL = "UPSTREAM_A2A_URL"
 )
 
 type Config struct {
-	HomeserverURL      string
-	Username           string
-	Password           string
-	StatePath          string
-	UpstreamA2AURL     string
-	SessionIdleTimeout time.Duration
+	HomeserverURL  string
+	Username       string
+	Password       string
+	StatePath      string
+	UpstreamA2AURL string
 }
 
 func FromEnv() (Config, error) {
@@ -40,12 +35,6 @@ func FromEnv() (Config, error) {
 	if cfg.StatePath == "" {
 		cfg.StatePath = defaultStatePath
 	}
-
-	idleTimeout, err := readDurationEnv(envSessionIdleTimeout, defaultSessionIdleTimeout)
-	if err != nil {
-		return Config{}, err
-	}
-	cfg.SessionIdleTimeout = idleTimeout
 
 	return cfg, cfg.Validate()
 }
@@ -62,9 +51,6 @@ func (c Config) Validate() error {
 	if c.UpstreamA2AURL == "" {
 		problems = append(problems, envUpstreamA2AURL+" is required")
 	}
-	if c.SessionIdleTimeout <= 0 {
-		problems = append(problems, envSessionIdleTimeout+" must be greater than zero")
-	}
 
 	hasPasswordAuth := c.Username != "" && c.Password != ""
 
@@ -80,17 +66,4 @@ func (c Config) Validate() error {
 		return nil
 	}
 	return errors.New(strings.Join(problems, "; "))
-}
-
-func readDurationEnv(name string, fallback time.Duration) (time.Duration, error) {
-	raw := strings.TrimSpace(os.Getenv(name))
-	if raw == "" {
-		return fallback, nil
-	}
-
-	value, err := time.ParseDuration(raw)
-	if err != nil {
-		return 0, fmt.Errorf("parse %s: %w", name, err)
-	}
-	return value, nil
 }

@@ -1,38 +1,53 @@
 # Matrix A2A Bridge
 
-This repo contains a Matrix DM runtime that bridges a Matrix account to an upstream A2A agent.
-It is not an onboarding workflow by itself. Product-specific onboarding belongs in the upstream
-agent or in a separate Amber assembly that composes this bridge with the right agent.
+This repo contains a Matrix event ingress runtime. It logs in as one Matrix account, syncs that
+account's room traffic, and delivers relevant Matrix events to an upstream A2A agent.
+
+It is not a chat bot runtime. It does not auto-join rooms, it does not synthesize replies, and it
+does not own conversational state on behalf of the upstream agent.
+
+## Boundary
+
+`matrix-a2a-bridge` is the Matrix-to-agent side of the integration.
+
+- It forwards Matrix events upstream.
+- It persists Matrix login and sync state locally so it can resume cleanly.
+- It ignores events authored by its own Matrix account so agent-driven Matrix writes do not loop.
+
+The peer for agent-driven Matrix actions is `../matrix-mcp`.
+
+- `matrix-a2a-bridge` tells the agent that something happened on Matrix.
+- `matrix-mcp` gives the agent the tool surface it needs to inspect rooms and write back to Matrix.
+
+That split keeps this component generic. The agent decides whether to join a room, what context to
+fetch, and what to send back.
 
 ## Behavior
 
 - logs in to a Matrix homeserver with password auth, then persists the resulting runtime session locally for restart and recovery
-- joins direct-message invites automatically
-- forwards Matrix text messages to an upstream A2A HTTP endpoint
-- sends the upstream agent reply back into the Matrix room as a normal text message
-- keeps per-room A2A task sessions in memory and cancels them after inactivity
-- persists a shared per-user A2A context ID in Matrix account data so later rooms and restarted runtimes can reuse the same context
+- syncs Matrix room state and timeline events for the configured account
+- forwards joined-room timeline events, joined-room state events, invite-state events, and left-room state or timeline events to the upstream A2A endpoint
+- skips initial joined-room backlog on a fresh state file so startup does not replay old traffic
+- preserves outstanding invites on first sync so the upstream agent can decide whether to join
+- ignores events sent by the bridge account itself to avoid feedback loops with `matrix-mcp`
 - persists only Matrix runtime state locally; it does not require a separate database
 
-## A2A Integration
+## Event Delivery
 
-The runtime expects an upstream A2A URL and resolves the agent card from
-`/.well-known/agent-card.json`.
+Each forwarded event is sent upstream as a non-blocking A2A notification.
 
-For each Matrix DM turn it sends:
+The request body is a JSON envelope with:
 
-- the user text
-- the current task ID when the room already has an active session
-- the shared context ID for that Matrix user when available
-- Matrix metadata such as the room ID and user ID
+- `kind: "matrix_event"`
+- `bridge_user_id`
+- `homeserver_url`
+- `source.room_section`: `join`, `invite`, or `leave`
+- `source.event_section`: `timeline` or `state`
+- `event`: the Matrix event payload
 
-The upstream response is expected to contain:
+The same envelope is also attached under `metadata.matrix_event`.
 
-- a natural-language text reply
-- standard A2A task state and task/context identifiers when the conversation remains active
-- optional artifacts, with the bridge falling back to the latest text artifact when the status message itself has no text
-
-`internal/a2a/mock.go` provides the mock upstream A2A server used by the tests and the local Amber demo.
+The bridge does not wait for a conversational reply and does not post anything back into Matrix.
 
 ## CI and image publishing
 
@@ -71,7 +86,6 @@ Required:
 Optional:
 
 - `MATRIX_STATE_PATH` defaults to `data/state.json`
-- `BOT_SESSION_IDLE_TIMEOUT` defaults to `10m`
 
 `MATRIX_USERNAME` can be either a localpart such as `bot` or a full Matrix user ID such as `@bot:example.com`.
 
@@ -88,29 +102,25 @@ Local state file:
 - sync cursor
 - handled-event journal
 
-Matrix account data:
-
-- shared per-user A2A context ID
-
-That split keeps deployment simple while still allowing the upstream agent context to survive bot
-restarts and new DM rooms.
+No upstream A2A task IDs, room sessions, or per-user context are stored here. Those concerns belong
+in the upstream agent.
 
 ## Run
 
 ```bash
-go run ./cmd/matrix-bot
+go run ./cmd/matrix-a2a-bridge
 ```
 
 ## Amber Manifests
 
 - `amber/matrix-a2a-bridge.json5` is the generic component manifest for this runtime
-- `amber/mock-demo.json5` composes the bridge with the bundled mock A2A server for local testing
-- `amber/codex-a2a-demo.json5` is an example composition with `codex-a2a`
+- `amber/mock-demo.json5` composes the bridge with the bundled mock A2A server for local ingress testing
+- `amber/codex-a2a-demo.json5` is an ingress-only example composition with `codex-a2a`
 
-If you want an onboarding experience, compose this bridge with an onboarding-oriented upstream
-agent in a different repo. That assembly does not belong here.
+If you want the upstream agent to respond on Matrix, compose the bridge with `matrix-mcp` as a peer
+tool surface for that same Matrix account.
 
-### Example: Codex A2A Demo
+### Example: Codex A2A Ingress Demo
 
 Start a Matrix homeserver separately. The bridge does not create its own Matrix account, so the bot
 username and password must already exist before the Amber stack starts.
@@ -146,7 +156,6 @@ Fill in `/tmp/matrix-a2a-bridge-compose/env.example` and then start the generate
 ```dotenv
 AMBER_CONFIG_MATRIX_USERNAME=bot
 AMBER_CONFIG_MATRIX_PASSWORD=bot-password
-AMBER_CONFIG_BOT_SESSION_IDLE_TIMEOUT=10m
 AMBER_EXTERNAL_SLOT_MATRIX_URL=127.0.0.1:6167
 ```
 
@@ -160,9 +169,10 @@ docker compose up -d
 amber proxy /tmp/matrix-a2a-bridge-compose --slot matrix=127.0.0.1:6167
 ```
 
-Once the stack is up, sign into Element against `http://127.0.0.1:6167`, start a DM with
-`@bot:tuwunel.test`, and send a message. The bridge should join the room and forward the chat to
-the upstream A2A agent.
+Once the stack is up, sign into Element against `http://127.0.0.1:6167`, create or invite
+`@bot:tuwunel.test` into a room, and send traffic there. The bridge will forward those Matrix
+events to the upstream A2A agent. For a full read/write agent workflow, pair that agent with
+`matrix-mcp`.
 
 ## Tests
 
@@ -175,5 +185,5 @@ GOCACHE=$(pwd)/.cache/go-build go test ./...
 Live Matrix tests:
 
 ```bash
-MATRIX_A2A_BRIDGE_RUN_LIVE=1 GOCACHE=$(pwd)/.cache/go-build go test ./internal/bot
+MATRIX_A2A_BRIDGE_RUN_LIVE=1 GOCACHE=$(pwd)/.cache/go-build go test ./internal/bridge
 ```
