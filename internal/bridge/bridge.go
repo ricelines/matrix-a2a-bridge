@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"maunium.net/go/mautrix"
@@ -23,6 +24,9 @@ type Bridge struct {
 	log      *slog.Logger
 	state    *state.Store
 	upstream *a2a.Client
+
+	roomLocksMu sync.Mutex
+	roomLocks   map[string]*sync.Mutex
 }
 
 func New(cfg config.Config, logger *slog.Logger) (*Bridge, error) {
@@ -49,10 +53,11 @@ func New(cfg config.Config, logger *slog.Logger) (*Bridge, error) {
 	client.DefaultHTTPBackoff = 2 * time.Second
 
 	matrixBridge := &Bridge{
-		client: client,
-		config: cfg,
-		log:    logger,
-		state:  stateStore,
+		client:    client,
+		config:    cfg,
+		log:       logger,
+		state:     stateStore,
+		roomLocks: make(map[string]*sync.Mutex),
 	}
 	matrixBridge.registerHandlers()
 	return matrixBridge, nil
@@ -280,19 +285,4 @@ func stripInitialBacklog(resp *mautrix.RespSync) {
 		room.Timeline.Events = nil
 		room.State.Events = nil
 	}
-}
-
-func (b *Bridge) markHandledEvent(eventID, eventKind string) error {
-	if eventID == "" {
-		return nil
-	}
-	if err := b.state.MarkHandled(eventID); err != nil {
-		b.log.Error("failed to persist handled event",
-			"event_id", eventID,
-			"event_kind", eventKind,
-			"err", err,
-		)
-		return err
-	}
-	return nil
 }

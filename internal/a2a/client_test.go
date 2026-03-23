@@ -17,6 +17,9 @@ func TestClientDeliverSendsNonBlockingNotification(t *testing.T) {
 	const body = `{"kind":"matrix_event"}`
 
 	var gotMetadata map[string]any
+	var gotContextID string
+	var gotReferenceTaskIDs []a2aproto.TaskID
+	var gotMessageID string
 
 	server := newLocalServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -44,10 +47,14 @@ func TestClientDeliverSendsNonBlockingNotification(t *testing.T) {
 				t.Fatalf("message/send body = %q, want %q", got, body)
 			}
 			gotMetadata = params.Metadata
+			gotContextID = params.Message.ContextID
+			gotReferenceTaskIDs = append([]a2aproto.TaskID(nil), params.Message.ReferenceTasks...)
+			gotMessageID = params.Message.ID
 
 			writeJSONRPCResponse(t, w, req.ID, map[string]any{
-				"kind": "task",
-				"id":   "task-123",
+				"kind":      "task",
+				"id":        "task-123",
+				"contextId": "ctx-123",
 				"status": map[string]any{
 					"state": "submitted",
 				},
@@ -62,28 +69,44 @@ func TestClientDeliverSendsNonBlockingNotification(t *testing.T) {
 		t.Fatalf("New() error = %v", err)
 	}
 
-	err = client.Deliver(context.Background(), Notification{
+	task, err := client.Deliver(context.Background(), Notification{
 		Body: body,
 		Metadata: map[string]any{
 			"matrix_event": map[string]any{
 				"kind": "matrix_event",
 			},
 		},
+	}, DeliveryOptions{
+		MessageID:       "msg-123",
+		ContextID:       "ctx-123",
+		ReferenceTaskID: "task-122",
 	})
 	if err != nil {
 		t.Fatalf("Deliver() error = %v", err)
+	}
+	if task.ID != "task-123" || task.ContextID != "ctx-123" {
+		t.Fatalf("Deliver() task = %#v, want returned task identity", task)
 	}
 
 	matrixEvent, ok := gotMetadata["matrix_event"].(map[string]any)
 	if !ok || matrixEvent["kind"] != "matrix_event" {
 		t.Fatalf("metadata = %#v, want matrix_event.kind", gotMetadata)
 	}
+	if gotContextID != "ctx-123" {
+		t.Fatalf("message/send contextId = %q, want %q", gotContextID, "ctx-123")
+	}
+	if len(gotReferenceTaskIDs) != 1 || gotReferenceTaskIDs[0] != "task-122" {
+		t.Fatalf("message/send referenceTaskIds = %#v, want [task-122]", gotReferenceTaskIDs)
+	}
+	if gotMessageID != "msg-123" {
+		t.Fatalf("message/send messageId = %q, want %q", gotMessageID, "msg-123")
+	}
 }
 
 func TestClientDeliverRejectsEmptyBody(t *testing.T) {
 	client := &Client{}
 
-	err := client.Deliver(context.Background(), Notification{Body: " \n\t "})
+	_, err := client.Deliver(context.Background(), Notification{Body: " \n\t "}, DeliveryOptions{})
 	if err == nil || !strings.Contains(err.Error(), "must not be empty") {
 		t.Fatalf("Deliver() error = %v, want empty body validation", err)
 	}

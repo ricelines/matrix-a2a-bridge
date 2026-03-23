@@ -15,6 +15,12 @@ type Notification struct {
 	Metadata map[string]any
 }
 
+type DeliveryOptions struct {
+	MessageID       string
+	ContextID       string
+	ReferenceTaskID string
+}
+
 type Client struct {
 	client *a2aclient.Client
 }
@@ -37,25 +43,53 @@ func New(ctx context.Context, baseURL string) (*Client, error) {
 	return &Client{client: client}, nil
 }
 
-func (c *Client) Deliver(ctx context.Context, notification Notification) error {
+func (c *Client) Deliver(ctx context.Context, notification Notification, options DeliveryOptions) (*a2aproto.Task, error) {
 	body := strings.TrimSpace(notification.Body)
 	if body == "" {
-		return fmt.Errorf("event notification body must not be empty")
+		return nil, fmt.Errorf("event notification body must not be empty")
+	}
+
+	message := a2aproto.NewMessage(
+		a2aproto.MessageRoleUser,
+		a2aproto.TextPart{Text: body},
+	)
+	if options.MessageID != "" {
+		message.ID = options.MessageID
+	}
+	if options.ContextID != "" {
+		message.ContextID = options.ContextID
+	}
+	if options.ReferenceTaskID != "" {
+		message.ReferenceTasks = []a2aproto.TaskID{a2aproto.TaskID(options.ReferenceTaskID)}
 	}
 
 	blocking := false
-	_, err := c.client.SendMessage(ctx, &a2aproto.MessageSendParams{
+	result, err := c.client.SendMessage(ctx, &a2aproto.MessageSendParams{
 		Config: &a2aproto.MessageSendConfig{
 			Blocking: &blocking,
 		},
-		Message: a2aproto.NewMessage(
-			a2aproto.MessageRoleUser,
-			a2aproto.TextPart{Text: body},
-		),
+		Message:  message,
 		Metadata: notification.Metadata,
 	})
 	if err != nil {
-		return fmt.Errorf("send upstream A2A notification: %w", err)
+		return nil, fmt.Errorf("send upstream A2A notification: %w", err)
 	}
-	return nil
+
+	task, ok := result.(*a2aproto.Task)
+	if !ok {
+		return nil, fmt.Errorf("send upstream A2A notification: expected task result, got %T", result)
+	}
+	return task, nil
+}
+
+func (c *Client) GetTask(ctx context.Context, taskID string) (*a2aproto.Task, error) {
+	if strings.TrimSpace(taskID) == "" {
+		return nil, fmt.Errorf("task id must not be empty")
+	}
+
+	task, err := c.client.GetTask(ctx, &a2aproto.TaskQueryParams{ID: a2aproto.TaskID(taskID)})
+	if err != nil {
+		return nil, fmt.Errorf("get upstream A2A task %s: %w", taskID, err)
+	}
+	return task, nil
 }

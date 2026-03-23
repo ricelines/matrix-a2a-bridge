@@ -16,14 +16,21 @@ import (
 const mockA2AEndpointPath = "/rpc"
 
 type RecordedNotification struct {
-	Body     string
-	Metadata map[string]any
+	Body           string
+	Metadata       map[string]any
+	MessageID      string
+	TaskID         string
+	ContextID      string
+	ReferenceTasks []string
+	History        []string
 }
 
 type MockServer struct {
 	mu            sync.Mutex
 	server        *httptest.Server
 	notifications []RecordedNotification
+	tasks         map[string]mockTask
+	contextTasks  map[string]map[string]struct{}
 }
 
 func StartMockServer() *MockServer {
@@ -47,7 +54,10 @@ func NewMockHTTPHandler() http.Handler {
 }
 
 func newMockServer() *MockServer {
-	return &MockServer{}
+	return &MockServer{
+		tasks:        make(map[string]mockTask),
+		contextTasks: make(map[string]map[string]struct{}),
+	}
 }
 
 func newMockHandler(mock *MockServer) http.Handler {
@@ -119,14 +129,91 @@ func requestBaseURL(r *http.Request) string {
 	return scheme + "://" + r.Host
 }
 
-func (m *MockServer) recordExecution(reqCtx *a2asrv.RequestContext) {
+func (m *MockServer) recordExecution(reqCtx *a2asrv.RequestContext) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	history, err := m.appendHistoryLocked(reqCtx)
+	if err != nil {
+		return err
+	}
+
+	referenceTasks := make([]string, 0, len(reqCtx.Message.ReferenceTasks))
+	for _, taskID := range reqCtx.Message.ReferenceTasks {
+		referenceTasks = append(referenceTasks, string(taskID))
+	}
 	m.notifications = append(m.notifications, RecordedNotification{
-		Body:     currentUserText(reqCtx.Message),
-		Metadata: cloneMetadata(reqCtx.Metadata),
+		Body:           currentUserText(reqCtx.Message),
+		Metadata:       cloneMetadata(reqCtx.Metadata),
+		MessageID:      reqCtx.Message.ID,
+		TaskID:         string(reqCtx.TaskID),
+		ContextID:      reqCtx.ContextID,
+		ReferenceTasks: referenceTasks,
+		History:        history,
 	})
+	return nil
+}
+
+type mockTask struct {
+	TaskID     string
+	ContextID  string
+	History    []string
+	ChildCount int
+}
+
+func (m *MockServer) appendHistoryLocked(reqCtx *a2asrv.RequestContext) ([]string, error) {
+	body := currentUserText(reqCtx.Message)
+	contextID := reqCtx.ContextID
+	parent, err := m.resolveParentLocked(contextID, reqCtx.Message.ReferenceTasks)
+	if err != nil {
+		return nil, err
+	}
+
+	history := []string{body}
+	if parent != nil {
+		parent.ChildCount++
+		m.tasks[parent.TaskID] = *parent
+		history = append(append([]string(nil), parent.History...), body)
+	}
+
+	taskID := string(reqCtx.TaskID)
+	m.tasks[taskID] = mockTask{
+		TaskID:    taskID,
+		ContextID: contextID,
+		History:   history,
+	}
+	if m.contextTasks[contextID] == nil {
+		m.contextTasks[contextID] = make(map[string]struct{})
+	}
+	m.contextTasks[contextID][taskID] = struct{}{}
+	return append([]string(nil), history...), nil
+}
+
+func (m *MockServer) resolveParentLocked(contextID string, references []a2aproto.TaskID) (*mockTask, error) {
+	switch {
+	case len(references) > 1:
+		return nil, fmt.Errorf("context %s has multiple references; supply exactly one referenceTaskId", contextID)
+	case len(references) == 1:
+		parent, ok := m.tasks[string(references[0])]
+		if !ok || parent.ContextID != contextID {
+			return nil, fmt.Errorf("reference task %s is not part of context %s", references[0], contextID)
+		}
+		return &parent, nil
+	}
+
+	var parent *mockTask
+	for taskID := range m.contextTasks[contextID] {
+		candidate := m.tasks[taskID]
+		if candidate.ChildCount != 0 {
+			continue
+		}
+		if parent != nil {
+			return nil, fmt.Errorf("context %s has multiple task branches; specify referenceTaskIds", contextID)
+		}
+		parentCopy := candidate
+		parent = &parentCopy
+	}
+	return parent, nil
 }
 
 func cloneMetadata(input map[string]any) map[string]any {
@@ -147,7 +234,19 @@ type mockExecutor struct {
 
 func (e *mockExecutor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, queue eventqueue.Queue) error {
 	if reqCtx.StoredTask == nil {
-		e.mock.recordExecution(reqCtx)
+		if err := e.mock.recordExecution(reqCtx); err != nil {
+			msg := a2aproto.NewMessageForTask(
+				a2aproto.MessageRoleAgent,
+				reqCtx,
+				a2aproto.TextPart{Text: err.Error()},
+			)
+			update := a2aproto.NewStatusUpdateEvent(reqCtx, a2aproto.TaskStateFailed, msg)
+			update.Final = true
+			if writeErr := queue.Write(ctx, update); writeErr != nil {
+				return fmt.Errorf("write failed status update: %w", writeErr)
+			}
+			return nil
+		}
 	}
 
 	msg := a2aproto.NewMessageForTask(

@@ -45,7 +45,7 @@ func (b *Bridge) handleEvent(ctx context.Context, evt *event.Event) {
 		return
 	}
 
-	if err := b.upstream.Deliver(ctx, notification); err != nil {
+	if err := b.deliverRoomEvent(ctx, evt, notification); err != nil {
 		b.log.Error("failed to deliver matrix event to upstream A2A",
 			"room_id", evt.RoomID.String(),
 			"event_id", evt.ID.String(),
@@ -56,7 +56,6 @@ func (b *Bridge) handleEvent(ctx context.Context, evt *event.Event) {
 		return
 	}
 
-	_ = b.markHandledEvent(evt.ID.String(), evt.Type.String())
 }
 
 func shouldForwardEvent(self id.UserID, evt *event.Event) bool {

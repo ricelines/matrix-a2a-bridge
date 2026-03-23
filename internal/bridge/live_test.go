@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -148,6 +149,65 @@ func TestBridgeIgnoresSelfAuthoredMessages(t *testing.T) {
 			n.Event.Type == "m.room.message" &&
 			n.Event.Content["body"] == body
 	})
+}
+
+func TestBridgeMaintainsSeparateRoomHistoriesPerRoom(t *testing.T) {
+	suite := sharedLiveSuite(t)
+
+	roomA := suite.createPrivateRoomWithBotInvite(t)
+	suite.joinRoomAsBot(t, roomA)
+	waitForJoinedMember(t, suite.alice.client, roomA, suite.botUserID, joinTimeout)
+
+	roomB := suite.createPrivateRoomWithBotInvite(t)
+	suite.joinRoomAsBot(t, roomB)
+	waitForJoinedMember(t, suite.alice.client, roomB, suite.botUserID, joinTimeout)
+
+	baseline := suite.upstream.NotificationCount()
+
+	suite.alice.sendText(t, roomA, "Hi. My name is Alice")
+	firstA := suite.waitForRecordedNotificationSince(t, baseline, eventForwardTimeout, func(n a2a.RecordedNotification) bool {
+		decoded := decodeNotification(t, n.Body)
+		return decoded.Event.RoomID == roomA.String() &&
+			decoded.Event.Content["body"] == "Hi. My name is Alice"
+	}, "first room A message was not forwarded upstream")
+
+	suite.alice.sendText(t, roomA, "What is my name?")
+	secondA := suite.waitForRecordedNotificationSince(t, baseline, eventForwardTimeout, func(n a2a.RecordedNotification) bool {
+		decoded := decodeNotification(t, n.Body)
+		return decoded.Event.RoomID == roomA.String() &&
+			decoded.Event.Content["body"] == "What is my name?"
+	}, "second room A message was not forwarded upstream")
+
+	suite.alice.sendText(t, roomB, "Hi. what is my name?")
+	firstB := suite.waitForRecordedNotificationSince(t, baseline, eventForwardTimeout, func(n a2a.RecordedNotification) bool {
+		decoded := decodeNotification(t, n.Body)
+		return decoded.Event.RoomID == roomB.String() &&
+			decoded.Event.Content["body"] == "Hi. what is my name?"
+	}, "room B message was not forwarded upstream")
+
+	if firstA.ContextID == "" {
+		t.Fatal("room A first context id should not be empty")
+	}
+	assertHistoryUsesOnlyRoom(t, firstA.History, roomA)
+	assertRoomMessageBodies(t, firstA.History, roomA, []string{"Hi. My name is Alice"})
+
+	if secondA.ContextID != firstA.ContextID {
+		t.Fatalf("room A second context id = %q, want %q", secondA.ContextID, firstA.ContextID)
+	}
+	if len(secondA.ReferenceTasks) != 1 || secondA.ReferenceTasks[0] != firstA.TaskID {
+		t.Fatalf("room A second reference tasks = %#v, want [%s]", secondA.ReferenceTasks, firstA.TaskID)
+	}
+	assertHistoryUsesOnlyRoom(t, secondA.History, roomA)
+	assertRoomMessageBodies(t, secondA.History, roomA, []string{"Hi. My name is Alice", "What is my name?"})
+
+	if firstB.ContextID == "" {
+		t.Fatal("room B context id should not be empty")
+	}
+	if firstB.ContextID == firstA.ContextID {
+		t.Fatalf("room B context id = %q, want distinct room-scoped context from room A", firstB.ContextID)
+	}
+	assertHistoryUsesOnlyRoom(t, firstB.History, roomB)
+	assertRoomMessageBodies(t, firstB.History, roomB, []string{"Hi. what is my name?"})
 }
 
 type liveSuite struct {
@@ -356,6 +416,23 @@ func (s *liveSuite) waitForNoMatchingNotificationSince(t *testing.T, start int, 
 	}
 }
 
+func (s *liveSuite) waitForRecordedNotificationSince(t *testing.T, start int, timeout time.Duration, predicate func(a2a.RecordedNotification) bool, message string) a2a.RecordedNotification {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		notifications := s.upstream.Notifications()
+		for i := start; i < len(notifications); i++ {
+			if predicate(notifications[i]) {
+				return notifications[i]
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal(message)
+	return a2a.RecordedNotification{}
+}
+
 func (s *liveSuite) assertNoBotJoinOrReply(t *testing.T, roomID id.RoomID, timeout time.Duration) {
 	t.Helper()
 
@@ -388,6 +465,47 @@ func decodeNotification(t *testing.T, body string) forwardedNotification {
 		t.Fatalf("json.Unmarshal(notification) error = %v", err)
 	}
 	return notification
+}
+
+func assertHistoryUsesOnlyRoom(t *testing.T, history []string, roomID id.RoomID) {
+	t.Helper()
+
+	for _, entry := range history {
+		decoded := decodeNotification(t, entry)
+		if decoded.Event.RoomID != roomID.String() {
+			t.Fatalf("history contains event for room %q, want only %q: %#v", decoded.Event.RoomID, roomID, history)
+		}
+	}
+}
+
+func assertRoomMessageBodies(t *testing.T, history []string, roomID id.RoomID, want []string) {
+	t.Helper()
+
+	got := roomMessageBodies(t, history, roomID)
+	if !slices.Equal(got, want) {
+		t.Fatalf("room %s message history = %#v, want %#v", roomID, got, want)
+	}
+}
+
+func roomMessageBodies(t *testing.T, history []string, roomID id.RoomID) []string {
+	t.Helper()
+
+	bodies := make([]string, 0, len(history))
+	for _, entry := range history {
+		decoded := decodeNotification(t, entry)
+		if decoded.Event.RoomID != roomID.String() {
+			continue
+		}
+		if decoded.Event.Type != event.EventMessage.String() {
+			continue
+		}
+		body, _ := decoded.Event.Content["body"].(string)
+		if body == "" {
+			continue
+		}
+		bodies = append(bodies, body)
+	}
+	return bodies
 }
 
 type runningBridge struct {
