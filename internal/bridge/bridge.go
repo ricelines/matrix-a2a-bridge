@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +30,11 @@ type Bridge struct {
 	roomLocksMu sync.Mutex
 	roomLocks   map[string]*sync.Mutex
 }
+
+const (
+	loginRetryInterval = 250 * time.Millisecond
+	loginRetryTimeout  = 15 * time.Second
+)
 
 func New(cfg config.Config, logger *slog.Logger) (*Bridge, error) {
 	if logger == nil {
@@ -109,23 +116,39 @@ func (b *Bridge) authenticate(ctx context.Context) error {
 }
 
 func (b *Bridge) loginWithPassword(ctx context.Context) error {
-	loginReq := &mautrix.ReqLogin{
-		Type: mautrix.AuthTypePassword,
-		Identifier: mautrix.UserIdentifier{
-			Type: mautrix.IdentifierTypeUser,
-			User: usernameForLogin(b.config.Username),
-		},
-		Password:                 b.config.Password,
-		InitialDeviceDisplayName: "matrix-a2a-bridge",
-		StoreCredentials:         true,
-	}
-	if b.client.DeviceID != "" {
-		loginReq.DeviceID = b.client.DeviceID
-	}
+	loginCtx, cancel := context.WithTimeout(ctx, loginRetryTimeout)
+	defer cancel()
 
-	resp, err := b.client.Login(ctx, loginReq)
-	if err != nil {
-		return fmt.Errorf("log in with password: %w", err)
+	var resp *mautrix.RespLogin
+	for {
+		loginReq := &mautrix.ReqLogin{
+			Type: mautrix.AuthTypePassword,
+			Identifier: mautrix.UserIdentifier{
+				Type: mautrix.IdentifierTypeUser,
+				User: usernameForLogin(b.config.Username),
+			},
+			Password:                 b.config.Password,
+			InitialDeviceDisplayName: "matrix-a2a-bridge",
+			StoreCredentials:         true,
+		}
+		if b.client.DeviceID != "" {
+			loginReq.DeviceID = b.client.DeviceID
+		}
+
+		var err error
+		resp, err = b.client.Login(loginCtx, loginReq)
+		if err == nil {
+			break
+		}
+		if !isTransientLoginError(err) || loginCtx.Err() != nil {
+			return fmt.Errorf("log in with password: %w", err)
+		}
+
+		select {
+		case <-loginCtx.Done():
+			return fmt.Errorf("log in with password: %w", err)
+		case <-time.After(loginRetryInterval):
+		}
 	}
 	if err := b.persistSession(); err != nil {
 		return err
@@ -137,6 +160,26 @@ func (b *Bridge) loginWithPassword(ctx context.Context) error {
 	)
 
 	return nil
+}
+
+func isTransientLoginError(err error) bool {
+	var httpErr mautrix.HTTPError
+	if errors.As(err, &httpErr) {
+		if httpErr.Response != nil {
+			if httpErr.Response.StatusCode >= http.StatusInternalServerError {
+				return true
+			}
+			if httpErr.Response.StatusCode == http.StatusTooManyRequests {
+				return true
+			}
+		}
+		if httpErr.RespError != nil && httpErr.RespError.CanRetry {
+			return true
+		}
+	}
+
+	var netErr net.Error
+	return errors.As(err, &netErr)
 }
 
 func usernameForLogin(input string) string {

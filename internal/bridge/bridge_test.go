@@ -20,8 +20,58 @@ import (
 	"maunium.net/go/mautrix/id"
 
 	"matrix-a2a-bridge/internal/a2a"
+	"matrix-a2a-bridge/internal/config"
 	"matrix-a2a-bridge/internal/state"
 )
+
+func TestLoginWithPasswordRetriesTransientFailure(t *testing.T) {
+	var loginCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/_matrix/client/v3/login" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		loginCalls++
+		if loginCalls < 3 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"errcode":"M_UNKNOWN","error":"try again"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"user_id":"@bridge:example.com","access_token":"token","device_id":"DEV1"}`))
+	}))
+	defer server.Close()
+
+	store, err := state.Open(filepath.Join(t.TempDir(), "bridge-state.json"))
+	if err != nil {
+		t.Fatalf("state.Open() error = %v", err)
+	}
+	client, err := mautrix.NewClient(server.URL, "", "")
+	if err != nil {
+		t.Fatalf("mautrix.NewClient() error = %v", err)
+	}
+
+	b := &Bridge{
+		client: client,
+		config: config.Config{
+			HomeserverURL: server.URL,
+			Username:      "bridge",
+			Password:      "pass",
+		},
+		log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		state:     store,
+		roomLocks: make(map[string]*sync.Mutex),
+	}
+	if err := b.loginWithPassword(context.Background()); err != nil {
+		t.Fatalf("loginWithPassword() error = %v", err)
+	}
+	if loginCalls != 3 {
+		t.Fatalf("login call count = %d, want 3", loginCalls)
+	}
+	if snapshot := store.Snapshot(); snapshot.Session.AccessToken == "" || snapshot.Session.UserID == "" {
+		t.Fatalf("expected persisted session after login, got %#v", snapshot.Session)
+	}
+}
 
 func TestShouldForwardEvent(t *testing.T) {
 	const self = id.UserID("@bridge:test")
