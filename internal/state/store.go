@@ -129,6 +129,15 @@ func (s *Store) RoomSession(roomID string) (RoomSession, bool) {
 }
 
 func (s *Store) RecordRoomDelivery(session RoomSession, eventID, eventType string) error {
+	return s.RecordRoomDeliveryBatch(session, []EventSummary{{ID: eventID, Type: eventType}})
+}
+
+type EventSummary struct {
+	ID   string
+	Type string
+}
+
+func (s *Store) RecordRoomDeliveryBatch(session RoomSession, events []EventSummary) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -136,12 +145,25 @@ func (s *Store) RecordRoomDelivery(session RoomSession, eventID, eventType strin
 		return fmt.Errorf("room session room_id must not be empty")
 	}
 
-	session.LastSuccessfulEventID = eventID
-	session.LastSuccessfulEventType = eventType
+	if last := lastDeliveredEvent(events); last != nil {
+		session.LastSuccessfulEventID = last.ID
+		session.LastSuccessfulEventType = last.Type
+	}
 	s.roomSessions[session.RoomID] = session
 	s.rebuildRoomSessionsLocked()
-	s.markHandledLocked(eventID)
+	for _, evt := range events {
+		s.markHandledLocked(evt.ID)
+	}
 	return s.saveLocked()
+}
+
+func lastDeliveredEvent(events []EventSummary) *EventSummary {
+	for idx := len(events) - 1; idx >= 0; idx-- {
+		if events[idx].ID != "" {
+			return &events[idx]
+		}
+	}
+	return nil
 }
 
 func (s *Store) rebuildHandledIndex() {

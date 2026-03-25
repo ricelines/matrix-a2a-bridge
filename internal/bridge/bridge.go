@@ -27,8 +27,9 @@ type Bridge struct {
 	state    *state.Store
 	upstream *a2a.Client
 
-	roomLocksMu sync.Mutex
-	roomLocks   map[string]*sync.Mutex
+	runCtx  context.Context
+	roomsMu sync.Mutex
+	rooms   map[string]*roomQueue
 }
 
 const (
@@ -60,17 +61,18 @@ func New(cfg config.Config, logger *slog.Logger) (*Bridge, error) {
 	client.DefaultHTTPBackoff = 2 * time.Second
 
 	matrixBridge := &Bridge{
-		client:    client,
-		config:    cfg,
-		log:       logger,
-		state:     stateStore,
-		roomLocks: make(map[string]*sync.Mutex),
+		client: client,
+		config: cfg,
+		log:    logger,
+		state:  stateStore,
+		rooms:  make(map[string]*roomQueue),
 	}
 	matrixBridge.registerHandlers()
 	return matrixBridge, nil
 }
 
 func (b *Bridge) Run(ctx context.Context) error {
+	b.runCtx = ctx
 	if err := b.authenticate(ctx); err != nil {
 		return err
 	}
@@ -194,7 +196,7 @@ func usernameForLogin(input string) string {
 
 func (b *Bridge) registerHandlers() {
 	syncer := b.client.Syncer.(*mautrix.DefaultSyncer)
-	syncer.OnEvent(b.handleEvent)
+	syncer.OnSync(b.handleSyncResponse)
 }
 
 func (b *Bridge) syncWithResume(ctx context.Context) error {

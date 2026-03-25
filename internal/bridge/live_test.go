@@ -51,20 +51,25 @@ var (
 )
 
 type forwardedNotification struct {
-	Kind         string `json:"kind"`
-	BridgeUserID string `json:"bridge_user_id"`
-	Source       struct {
-		RoomSection  string `json:"room_section"`
-		EventSection string `json:"event_section"`
-	} `json:"source"`
-	Event struct {
-		EventID  string         `json:"event_id,omitempty"`
-		RoomID   string         `json:"room_id,omitempty"`
-		Sender   string         `json:"sender,omitempty"`
-		StateKey string         `json:"state_key,omitempty"`
-		Type     string         `json:"type"`
-		Content  map[string]any `json:"content"`
-	} `json:"event"`
+	Kind         string                      `json:"kind"`
+	BridgeUserID string                      `json:"bridge_user_id"`
+	RoomID       string                      `json:"room_id"`
+	Updates      []forwardedNotificationPart `json:"updates"`
+}
+
+type forwardedNotificationPart struct {
+	RoomSection string                     `json:"room_section"`
+	State       []forwardedNotificationEvt `json:"state,omitempty"`
+	Timeline    []forwardedNotificationEvt `json:"timeline,omitempty"`
+}
+
+type forwardedNotificationEvt struct {
+	EventID  string         `json:"event_id,omitempty"`
+	RoomID   string         `json:"room_id,omitempty"`
+	Sender   string         `json:"sender,omitempty"`
+	StateKey string         `json:"state_key,omitempty"`
+	Type     string         `json:"type"`
+	Content  map[string]any `json:"content"`
 }
 
 func TestMain(m *testing.M) {
@@ -89,15 +94,22 @@ func TestBridgeForwardsInviteWithoutAutoJoining(t *testing.T) {
 	roomID := suite.createPrivateRoomWithBotInvite(t)
 
 	notification := suite.waitForNotificationSince(t, baseline, eventForwardTimeout, func(n forwardedNotification) bool {
-		return n.Kind == "matrix_event" &&
+		return n.Kind == "matrix_room_update" &&
 			n.BridgeUserID == suite.botUserID.String() &&
-			n.Source.RoomSection == "invite" &&
-			n.Source.EventSection == "state" &&
-			n.Event.RoomID == roomID.String()
+			n.RoomID == roomID.String() &&
+			len(n.Updates) == 1 &&
+			n.Updates[0].RoomSection == "invite" &&
+			len(n.Updates[0].State) >= 2 &&
+			hasMatchingForwardedEvent(n.Updates[0].State, func(evt forwardedNotificationEvt) bool {
+				return evt.RoomID == roomID.String() &&
+					evt.Type == event.StateMember.String() &&
+					evt.StateKey == suite.botUserID.String() &&
+					evt.Content["membership"] == "invite"
+			})
 	}, "invite event was not forwarded upstream")
 
-	if notification.Event.RoomID != roomID.String() {
-		t.Fatalf("notification room_id = %q, want %q", notification.Event.RoomID, roomID)
+	if notification.RoomID != roomID.String() {
+		t.Fatalf("notification room_id = %q, want %q", notification.RoomID, roomID)
 	}
 
 	suite.assertNoBotJoinOrReply(t, roomID, noActivityWindow)
@@ -114,17 +126,21 @@ func TestBridgeForwardsJoinedRoomMessagesWithoutReplying(t *testing.T) {
 	suite.alice.sendText(t, roomID, "hello from the room")
 
 	notification := suite.waitForNotificationSince(t, baseline, eventForwardTimeout, func(n forwardedNotification) bool {
-		return n.Kind == "matrix_event" &&
-			n.Source.RoomSection == "join" &&
-			n.Source.EventSection == "timeline" &&
-			n.Event.RoomID == roomID.String() &&
-			n.Event.Sender == suite.aliceUserID.String() &&
-			n.Event.Type == "m.room.message" &&
-			n.Event.Content["body"] == "hello from the room"
+		return n.Kind == "matrix_room_update" &&
+			n.RoomID == roomID.String() &&
+			hasMatchingForwardedTimelineEvent(n, func(evt forwardedNotificationEvt) bool {
+				return evt.RoomID == roomID.String() &&
+					evt.Sender == suite.aliceUserID.String() &&
+					evt.Type == event.EventMessage.String() &&
+					evt.Content["body"] == "hello from the room"
+			})
 	}, "joined-room message was not forwarded upstream")
 
-	if notification.Event.Content["msgtype"] != "m.text" {
-		t.Fatalf("notification content = %#v, want msgtype m.text", notification.Event.Content)
+	eventBody, ok := firstMatchingForwardedTimelineEvent(notification, func(evt forwardedNotificationEvt) bool {
+		return evt.Type == event.EventMessage.String() && evt.Content["body"] == "hello from the room"
+	})
+	if !ok || eventBody.Content["msgtype"] != "m.text" {
+		t.Fatalf("notification content = %#v, want msgtype m.text", eventBody.Content)
 	}
 
 	suite.alice.waitForNoMessageFrom(t, roomID, suite.botUserID, noActivityWindow)
@@ -141,13 +157,13 @@ func TestBridgeIgnoresSelfAuthoredMessages(t *testing.T) {
 	body := "message sent as the bridge account"
 	suite.sendTextAsBot(t, roomID, body)
 	suite.waitForNoMatchingNotificationSince(t, baseline, noActivityWindow, func(n forwardedNotification) bool {
-		return n.Kind == "matrix_event" &&
-			n.Source.RoomSection == "join" &&
-			n.Source.EventSection == "timeline" &&
-			n.Event.RoomID == roomID.String() &&
-			n.Event.Sender == suite.botUserID.String() &&
-			n.Event.Type == "m.room.message" &&
-			n.Event.Content["body"] == body
+		return n.Kind == "matrix_room_update" &&
+			n.RoomID == roomID.String() &&
+			hasMatchingForwardedTimelineEvent(n, func(evt forwardedNotificationEvt) bool {
+				return evt.Sender == suite.botUserID.String() &&
+					evt.Type == event.EventMessage.String() &&
+					evt.Content["body"] == body
+			})
 	})
 }
 
@@ -167,22 +183,28 @@ func TestBridgeMaintainsSeparateRoomHistoriesPerRoom(t *testing.T) {
 	suite.alice.sendText(t, roomA, "Hi. My name is Alice")
 	firstA := suite.waitForRecordedNotificationSince(t, baseline, eventForwardTimeout, func(n a2a.RecordedNotification) bool {
 		decoded := decodeNotification(t, n.Body)
-		return decoded.Event.RoomID == roomA.String() &&
-			decoded.Event.Content["body"] == "Hi. My name is Alice"
+		return decoded.RoomID == roomA.String() &&
+			hasMatchingForwardedTimelineEvent(decoded, func(evt forwardedNotificationEvt) bool {
+				return evt.Content["body"] == "Hi. My name is Alice"
+			})
 	}, "first room A message was not forwarded upstream")
 
 	suite.alice.sendText(t, roomA, "What is my name?")
 	secondA := suite.waitForRecordedNotificationSince(t, baseline, eventForwardTimeout, func(n a2a.RecordedNotification) bool {
 		decoded := decodeNotification(t, n.Body)
-		return decoded.Event.RoomID == roomA.String() &&
-			decoded.Event.Content["body"] == "What is my name?"
+		return decoded.RoomID == roomA.String() &&
+			hasMatchingForwardedTimelineEvent(decoded, func(evt forwardedNotificationEvt) bool {
+				return evt.Content["body"] == "What is my name?"
+			})
 	}, "second room A message was not forwarded upstream")
 
 	suite.alice.sendText(t, roomB, "Hi. what is my name?")
 	firstB := suite.waitForRecordedNotificationSince(t, baseline, eventForwardTimeout, func(n a2a.RecordedNotification) bool {
 		decoded := decodeNotification(t, n.Body)
-		return decoded.Event.RoomID == roomB.String() &&
-			decoded.Event.Content["body"] == "Hi. what is my name?"
+		return decoded.RoomID == roomB.String() &&
+			hasMatchingForwardedTimelineEvent(decoded, func(evt forwardedNotificationEvt) bool {
+				return evt.Content["body"] == "Hi. what is my name?"
+			})
 	}, "room B message was not forwarded upstream")
 
 	if firstA.ContextID == "" {
@@ -472,8 +494,8 @@ func assertHistoryUsesOnlyRoom(t *testing.T, history []string, roomID id.RoomID)
 
 	for _, entry := range history {
 		decoded := decodeNotification(t, entry)
-		if decoded.Event.RoomID != roomID.String() {
-			t.Fatalf("history contains event for room %q, want only %q: %#v", decoded.Event.RoomID, roomID, history)
+		if decoded.RoomID != roomID.String() {
+			t.Fatalf("history contains event for room %q, want only %q: %#v", decoded.RoomID, roomID, history)
 		}
 	}
 }
@@ -493,19 +515,48 @@ func roomMessageBodies(t *testing.T, history []string, roomID id.RoomID) []strin
 	bodies := make([]string, 0, len(history))
 	for _, entry := range history {
 		decoded := decodeNotification(t, entry)
-		if decoded.Event.RoomID != roomID.String() {
+		if decoded.RoomID != roomID.String() {
 			continue
 		}
-		if decoded.Event.Type != event.EventMessage.String() {
-			continue
+		for _, update := range decoded.Updates {
+			for _, evt := range update.Timeline {
+				if evt.Type != event.EventMessage.String() {
+					continue
+				}
+				body, _ := evt.Content["body"].(string)
+				if body == "" {
+					continue
+				}
+				bodies = append(bodies, body)
+			}
 		}
-		body, _ := decoded.Event.Content["body"].(string)
-		if body == "" {
-			continue
-		}
-		bodies = append(bodies, body)
 	}
 	return bodies
+}
+
+func hasMatchingForwardedEvent(events []forwardedNotificationEvt, predicate func(forwardedNotificationEvt) bool) bool {
+	for _, evt := range events {
+		if predicate(evt) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasMatchingForwardedTimelineEvent(notification forwardedNotification, predicate func(forwardedNotificationEvt) bool) bool {
+	_, ok := firstMatchingForwardedTimelineEvent(notification, predicate)
+	return ok
+}
+
+func firstMatchingForwardedTimelineEvent(notification forwardedNotification, predicate func(forwardedNotificationEvt) bool) (forwardedNotificationEvt, bool) {
+	for _, update := range notification.Updates {
+		for _, evt := range update.Timeline {
+			if predicate(evt) {
+				return evt, true
+			}
+		}
+	}
+	return forwardedNotificationEvt{}, false
 }
 
 type runningBridge struct {

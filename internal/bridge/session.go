@@ -9,7 +9,6 @@ import (
 	"time"
 
 	a2aproto "github.com/a2aproject/a2a-go/a2a"
-	"maunium.net/go/mautrix/event"
 
 	bridgea2a "matrix-a2a-bridge/internal/a2a"
 	"matrix-a2a-bridge/internal/state"
@@ -20,53 +19,105 @@ const (
 	taskTerminalWaitTimeout  = 30 * time.Second
 )
 
-func (b *Bridge) deliverRoomEvent(ctx context.Context, evt *event.Event, notification bridgea2a.Notification) error {
-	roomID := evt.RoomID.String()
-	lock := b.roomLock(roomID)
-	lock.Lock()
-	defer lock.Unlock()
+type roomQueue struct {
+	mu         sync.Mutex
+	pending    roomUpdateBatch
+	hasPending bool
+	running    bool
+}
 
-	eventID := evt.ID.String()
-	if eventID != "" && b.state.IsHandled(eventID) {
-		return nil
+func (b *Bridge) enqueueRoomUpdate(ctx context.Context, batch roomUpdateBatch) {
+	if batch.RoomID == "" || len(batch.Updates) == 0 {
+		return
 	}
 
-	session := b.loadRoomSession(roomID)
-	if err := b.waitForRoomTaskTerminal(ctx, &session); err != nil {
-		return err
+	queue := b.roomQueue(batch.RoomID)
+	queue.mu.Lock()
+	queue.pending = mergeRoomUpdateBatches(queue.pending, batch)
+	queue.hasPending = true
+	if queue.running {
+		queue.mu.Unlock()
+		return
+	}
+	queue.running = true
+	queue.mu.Unlock()
+
+	go b.runRoomQueue(b.deliveryContext(ctx), queue)
+}
+
+func (b *Bridge) roomQueue(roomID string) *roomQueue {
+	b.roomsMu.Lock()
+	defer b.roomsMu.Unlock()
+
+	if b.rooms == nil {
+		b.rooms = make(map[string]*roomQueue)
 	}
 
-	task, updatedSession, err := b.deliverWithRecovery(ctx, evt, notification, session)
+	queue := b.rooms[roomID]
+	if queue == nil {
+		queue = &roomQueue{}
+		b.rooms[roomID] = queue
+	}
+	return queue
+}
+
+func (b *Bridge) deliveryContext(fallback context.Context) context.Context {
+	if b.runCtx != nil {
+		return b.runCtx
+	}
+	if fallback != nil {
+		return fallback
+	}
+	return context.Background()
+}
+
+func (b *Bridge) runRoomQueue(ctx context.Context, queue *roomQueue) {
+	for {
+		queue.mu.Lock()
+		if !queue.hasPending {
+			queue.running = false
+			queue.mu.Unlock()
+			return
+		}
+		batch := queue.pending
+		queue.pending = roomUpdateBatch{}
+		queue.hasPending = false
+		queue.mu.Unlock()
+
+		if err := b.deliverRoomUpdate(ctx, batch); err != nil {
+			b.log.Error("failed to deliver matrix room update to upstream A2A",
+				"room_id", batch.RoomID,
+				"err", err,
+			)
+		}
+	}
+}
+
+func (b *Bridge) deliverRoomUpdate(ctx context.Context, batch roomUpdateBatch) error {
+	notification, err := buildRoomUpdateNotification(b.client.UserID, b.config.HomeserverURL, batch)
 	if err != nil {
 		return err
 	}
 
-	b.log.Info("delivered matrix room event to upstream A2A",
-		"room_id", roomID,
-		"event_id", eventID,
-		"event_type", evt.Type.String(),
+	session := b.loadRoomSession(batch.RoomID)
+	if err := b.waitForRoomTaskTerminal(ctx, &session); err != nil {
+		return err
+	}
+
+	task, updatedSession, err := b.deliverWithRecovery(ctx, batch, notification, session)
+	if err != nil {
+		return err
+	}
+
+	b.log.Info("delivered matrix room update to upstream A2A",
+		"room_id", batch.RoomID,
 		"context_id", updatedSession.ContextID,
 		"task_id", task.ID,
 		"task_state", task.Status.State,
+		"update_count", len(batch.Updates),
 	)
 
-	return b.state.RecordRoomDelivery(updatedSession, eventID, evt.Type.String())
-}
-
-func (b *Bridge) roomLock(roomID string) *sync.Mutex {
-	b.roomLocksMu.Lock()
-	defer b.roomLocksMu.Unlock()
-
-	if b.roomLocks == nil {
-		b.roomLocks = make(map[string]*sync.Mutex)
-	}
-
-	lock := b.roomLocks[roomID]
-	if lock == nil {
-		lock = &sync.Mutex{}
-		b.roomLocks[roomID] = lock
-	}
-	return lock
+	return b.state.RecordRoomDeliveryBatch(updatedSession, batch.handledEvents())
 }
 
 func (b *Bridge) loadRoomSession(roomID string) state.RoomSession {
@@ -113,11 +164,11 @@ func (b *Bridge) waitForRoomTaskTerminal(ctx context.Context, session *state.Roo
 
 func (b *Bridge) deliverWithRecovery(
 	ctx context.Context,
-	evt *event.Event,
+	batch roomUpdateBatch,
 	notification bridgea2a.Notification,
 	session state.RoomSession,
 ) (*a2aproto.Task, state.RoomSession, error) {
-	task, updatedSession, err := b.deliverAttempt(ctx, evt, notification, session)
+	task, updatedSession, err := b.deliverAttempt(ctx, batch, notification, session)
 	if err != nil {
 		return nil, session, err
 	}
@@ -134,7 +185,7 @@ func (b *Bridge) deliverWithRecovery(
 		)
 		withoutReference := updatedSession
 		withoutReference.LatestTaskID = ""
-		task, retriedSession, err := b.deliverAttempt(ctx, evt, notification, withoutReference)
+		task, retriedSession, err := b.deliverAttempt(ctx, batch, notification, withoutReference)
 		if err != nil {
 			return nil, session, err
 		}
@@ -152,7 +203,7 @@ func (b *Bridge) deliverWithRecovery(
 	freshContext := updatedSession
 	freshContext.ContextID = a2aproto.NewContextID()
 	freshContext.LatestTaskID = ""
-	task, freshSession, err := b.deliverAttempt(ctx, evt, notification, freshContext)
+	task, freshSession, err := b.deliverAttempt(ctx, batch, notification, freshContext)
 	if err != nil {
 		return nil, session, err
 	}
@@ -164,12 +215,12 @@ func (b *Bridge) deliverWithRecovery(
 
 func (b *Bridge) deliverAttempt(
 	ctx context.Context,
-	evt *event.Event,
+	batch roomUpdateBatch,
 	notification bridgea2a.Notification,
 	session state.RoomSession,
 ) (*a2aproto.Task, state.RoomSession, error) {
 	task, err := b.upstream.Deliver(ctx, notification, bridgea2a.DeliveryOptions{
-		MessageID:       messageIDForEvent(evt),
+		MessageID:       messageIDForBatch(batch),
 		ContextID:       session.ContextID,
 		ReferenceTaskID: session.LatestTaskID,
 	})
@@ -194,9 +245,9 @@ func (b *Bridge) deliverAttempt(
 	return task, session, nil
 }
 
-func messageIDForEvent(evt *event.Event) string {
-	if evt != nil && evt.ID != "" {
-		return evt.ID.String()
+func messageIDForBatch(batch roomUpdateBatch) string {
+	if messageID := strings.TrimSpace(batch.messageID()); messageID != "" {
+		return messageID
 	}
 	return a2aproto.NewMessageID()
 }

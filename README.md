@@ -1,7 +1,7 @@
 # Matrix A2A Bridge
 
-This repo contains a Matrix event ingress runtime. It logs in as one Matrix account, syncs that
-account's room traffic, and delivers relevant Matrix events to an upstream A2A agent.
+This repo contains a Matrix room-update ingress runtime. It logs in as one Matrix account, syncs
+that account's room traffic, and delivers relevant Matrix room updates to an upstream A2A agent.
 
 It is not a chat bot runtime. It does not auto-join rooms, it does not synthesize replies, and it
 does not own conversational state on behalf of the upstream agent.
@@ -10,13 +10,13 @@ does not own conversational state on behalf of the upstream agent.
 
 `matrix-a2a-bridge` is the Matrix-to-agent side of the integration.
 
-- It forwards Matrix events upstream.
+- It forwards Matrix room updates upstream.
 - It persists Matrix login and sync state locally so it can resume cleanly.
 - It ignores events authored by its own Matrix account so agent-driven Matrix writes do not loop.
 
-The peer for agent-driven Matrix actions is `../matrix-mcp`.
+The peer for agent-driven Matrix actions is `matrix-mcp`.
 
-- `matrix-a2a-bridge` tells the agent that something happened on Matrix.
+- `matrix-a2a-bridge` tells the agent that something changed in a Matrix room.
 - `matrix-mcp` gives the agent the tool surface it needs to inspect rooms and write back to Matrix.
 
 That split keeps this component generic. The agent decides whether to join a room, what context to
@@ -26,26 +26,33 @@ fetch, and what to send back.
 
 - logs in to a Matrix homeserver with password auth, then persists the resulting runtime session locally for restart and recovery
 - syncs Matrix room state and timeline events for the configured account
-- forwards joined-room timeline events, joined-room state events, invite-state events, and left-room state or timeline events to the upstream A2A endpoint
+- forwards room-scoped `/sync` deltas for joined, invited, and left rooms to the upstream A2A endpoint
 - skips initial joined-room backlog on a fresh state file so startup does not replay old traffic
 - preserves outstanding invites on first sync so the upstream agent can decide whether to join
 - ignores events sent by the bridge account itself to avoid feedback loops with `matrix-mcp`
+- merges additional `/sync` deltas into one pending room batch while a previous delivery for that room is still in flight
 - persists only Matrix runtime state locally; it does not require a separate database
 
 ## Event Delivery
 
-Each forwarded event is sent upstream as a non-blocking A2A notification.
+Each forwarded room update is sent upstream as an A2A notification.
+
+Delivery is room-serialized: the bridge keeps at most one in-flight upstream task per room, and if
+more Matrix updates arrive for that same room while the task is still running, they are merged into
+one pending room batch.
 
 The request body is a JSON envelope with:
 
-- `kind: "matrix_event"`
+- `kind: "matrix_room_update"`
 - `bridge_user_id`
 - `homeserver_url`
-- `source.room_section`: `join`, `invite`, or `leave`
-- `source.event_section`: `timeline` or `state`
-- `event`: the Matrix event payload
+- `room_id`
+- `updates[]`
+  - `room_section`: `join`, `invite`, or `leave`
+  - `state[]`: Matrix state events from that room delta
+  - `timeline[]`: Matrix timeline events from that room delta
 
-The same envelope is also attached under `metadata.matrix_event`.
+The same envelope is also attached under `metadata.matrix_room_update`.
 
 The bridge does not wait for a conversational reply and does not post anything back into Matrix.
 
