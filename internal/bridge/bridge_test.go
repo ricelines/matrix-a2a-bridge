@@ -288,9 +288,9 @@ func TestHandleSyncResponseBatchesRoomStateAndTimelineIntoOneNotification(t *tes
 
 func TestHandleSyncResponseMergesPendingUpdatesWhileTaskActive(t *testing.T) {
 	type deliveredMessage struct {
-		Body           string
-		ContextID      string
-		ReferenceTasks []a2aproto.TaskID
+		Body      string
+		ContextID string
+		TaskID    a2aproto.TaskID
 	}
 
 	var (
@@ -317,18 +317,14 @@ func TestHandleSyncResponseMergesPendingUpdatesWhileTaskActive(t *testing.T) {
 				t.Fatalf("Unmarshal(message/send params) error = %v", err)
 			}
 			delivered = append(delivered, deliveredMessage{
-				Body:           messageText(params.Message),
-				ContextID:      params.Message.ContextID,
-				ReferenceTasks: append([]a2aproto.TaskID(nil), params.Message.ReferenceTasks...),
+				Body:      messageText(params.Message),
+				ContextID: params.Message.ContextID,
+				TaskID:    params.Message.TaskID,
 			})
 
-			taskID := "task-1"
-			if len(delivered) == 2 {
-				taskID = "task-2"
-			}
 			writeJSONRPCResponse(t, w, req.ID, map[string]any{
 				"kind":      "task",
-				"id":        taskID,
+				"id":        "task-1",
 				"contextId": params.Message.ContextID,
 				"status": map[string]any{
 					"state": "submitted",
@@ -341,7 +337,7 @@ func TestHandleSyncResponseMergesPendingUpdatesWhileTaskActive(t *testing.T) {
 				"id":        "task-1",
 				"contextId": delivered[0].ContextID,
 				"status": map[string]any{
-					"state": "completed",
+					"state": "input-required",
 				},
 			})
 		default:
@@ -374,8 +370,8 @@ func TestHandleSyncResponseMergesPendingUpdatesWhileTaskActive(t *testing.T) {
 	if len(second.Updates) != 2 {
 		t.Fatalf("merged update count = %d, want 2", len(second.Updates))
 	}
-	if len(delivered[1].ReferenceTasks) != 1 || delivered[1].ReferenceTasks[0] != "task-1" {
-		t.Fatalf("second delivery reference tasks = %#v, want [task-1]", delivered[1].ReferenceTasks)
+	if delivered[1].TaskID != "task-1" {
+		t.Fatalf("second delivery task id = %q, want %q", delivered[1].TaskID, "task-1")
 	}
 	if got := roomMessageBodiesFromUpdate(second); !equalStrings(got, []string{"second", "third"}) {
 		t.Fatalf("merged message bodies = %#v, want [second third]", got)
@@ -442,9 +438,9 @@ func TestRunRoomQueueRetriesFailedDelivery(t *testing.T) {
 
 func TestDeliverRoomUpdateContinuesSameRoomSession(t *testing.T) {
 	type deliveredMessage struct {
-		MessageID      string
-		ContextID      string
-		ReferenceTasks []a2aproto.TaskID
+		MessageID string
+		ContextID string
+		TaskID    a2aproto.TaskID
 	}
 
 	var delivered []deliveredMessage
@@ -469,18 +465,14 @@ func TestDeliverRoomUpdateContinuesSameRoomSession(t *testing.T) {
 				t.Fatalf("Unmarshal(message/send params) error = %v", err)
 			}
 			delivered = append(delivered, deliveredMessage{
-				MessageID:      params.Message.ID,
-				ContextID:      params.Message.ContextID,
-				ReferenceTasks: append([]a2aproto.TaskID(nil), params.Message.ReferenceTasks...),
+				MessageID: params.Message.ID,
+				ContextID: params.Message.ContextID,
+				TaskID:    params.Message.TaskID,
 			})
 
-			taskID := "task-1"
-			if len(delivered) == 2 {
-				taskID = "task-2"
-			}
 			writeJSONRPCResponse(t, w, req.ID, map[string]any{
 				"kind":      "task",
-				"id":        taskID,
+				"id":        "task-1",
 				"contextId": params.Message.ContextID,
 				"status": map[string]any{
 					"state": "submitted",
@@ -497,7 +489,7 @@ func TestDeliverRoomUpdateContinuesSameRoomSession(t *testing.T) {
 				"id":        string(params.ID),
 				"contextId": delivered[0].ContextID,
 				"status": map[string]any{
-					"state": "completed",
+					"state": "input-required",
 				},
 			})
 		default:
@@ -529,14 +521,14 @@ func TestDeliverRoomUpdateContinuesSameRoomSession(t *testing.T) {
 	if delivered[0].ContextID == "" {
 		t.Fatal("first delivery context id should not be empty")
 	}
-	if len(delivered[0].ReferenceTasks) != 0 {
-		t.Fatalf("first delivery reference tasks = %#v, want none", delivered[0].ReferenceTasks)
+	if delivered[0].TaskID != "" {
+		t.Fatalf("first delivery task id = %q, want empty", delivered[0].TaskID)
 	}
 	if delivered[1].ContextID != delivered[0].ContextID {
 		t.Fatalf("second delivery context id = %q, want %q", delivered[1].ContextID, delivered[0].ContextID)
 	}
-	if len(delivered[1].ReferenceTasks) != 1 || delivered[1].ReferenceTasks[0] != "task-1" {
-		t.Fatalf("second delivery reference tasks = %#v, want [task-1]", delivered[1].ReferenceTasks)
+	if delivered[1].TaskID != "task-1" {
+		t.Fatalf("second delivery task id = %q, want %q", delivered[1].TaskID, "task-1")
 	}
 	if len(getTaskCalls) != 1 || getTaskCalls[0] != "task-1" {
 		t.Fatalf("tasks/get calls = %#v, want [task-1]", getTaskCalls)
@@ -546,15 +538,15 @@ func TestDeliverRoomUpdateContinuesSameRoomSession(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected stored room session for %s", roomID)
 	}
-	if session.ContextID != delivered[0].ContextID || session.LatestTaskID != "task-2" {
+	if session.ContextID != delivered[0].ContextID || session.LatestTaskID != "task-1" {
 		t.Fatalf("stored room session = %#v, want updated continuation handle", session)
 	}
 }
 
 func TestDeliverRoomUpdateRetriesWithoutReferenceTaskWhenLatestTaskIsMissing(t *testing.T) {
 	type deliveredMessage struct {
-		ContextID      string
-		ReferenceTasks []a2aproto.TaskID
+		ContextID string
+		TaskID    a2aproto.TaskID
 	}
 
 	var delivered []deliveredMessage
@@ -580,8 +572,8 @@ func TestDeliverRoomUpdateRetriesWithoutReferenceTaskWhenLatestTaskIsMissing(t *
 				t.Fatalf("Unmarshal(message/send params) error = %v", err)
 			}
 			delivered = append(delivered, deliveredMessage{
-				ContextID:      params.Message.ContextID,
-				ReferenceTasks: append([]a2aproto.TaskID(nil), params.Message.ReferenceTasks...),
+				ContextID: params.Message.ContextID,
+				TaskID:    params.Message.TaskID,
 			})
 			writeJSONRPCResponse(t, w, req.ID, map[string]any{
 				"kind":      "task",
@@ -623,15 +615,15 @@ func TestDeliverRoomUpdateRetriesWithoutReferenceTaskWhenLatestTaskIsMissing(t *
 	if delivered[0].ContextID != "ctx-room" {
 		t.Fatalf("delivery context id = %q, want %q", delivered[0].ContextID, "ctx-room")
 	}
-	if len(delivered[0].ReferenceTasks) != 0 {
-		t.Fatalf("delivery reference tasks = %#v, want none after task lookup miss", delivered[0].ReferenceTasks)
+	if delivered[0].TaskID != "" {
+		t.Fatalf("delivery task id = %q, want none after task lookup miss", delivered[0].TaskID)
 	}
 }
 
 func TestDeliverRoomUpdateResetsContextAfterContinuationFailure(t *testing.T) {
 	type deliveredMessage struct {
-		ContextID      string
-		ReferenceTasks []a2aproto.TaskID
+		ContextID string
+		TaskID    a2aproto.TaskID
 	}
 
 	var delivered []deliveredMessage
@@ -655,7 +647,7 @@ func TestDeliverRoomUpdateResetsContextAfterContinuationFailure(t *testing.T) {
 				"id":        "task-old",
 				"contextId": "ctx-room",
 				"status": map[string]any{
-					"state": "completed",
+					"state": "input-required",
 				},
 			})
 		case "message/send":
@@ -664,8 +656,8 @@ func TestDeliverRoomUpdateResetsContextAfterContinuationFailure(t *testing.T) {
 				t.Fatalf("Unmarshal(message/send params) error = %v", err)
 			}
 			delivered = append(delivered, deliveredMessage{
-				ContextID:      params.Message.ContextID,
-				ReferenceTasks: append([]a2aproto.TaskID(nil), params.Message.ReferenceTasks...),
+				ContextID: params.Message.ContextID,
+				TaskID:    params.Message.TaskID,
 			})
 
 			if len(delivered) < 3 {
@@ -725,20 +717,20 @@ func TestDeliverRoomUpdateResetsContextAfterContinuationFailure(t *testing.T) {
 	if delivered[0].ContextID != "ctx-room" {
 		t.Fatalf("first delivery context id = %q, want ctx-room", delivered[0].ContextID)
 	}
-	if len(delivered[0].ReferenceTasks) != 1 || delivered[0].ReferenceTasks[0] != "task-old" {
-		t.Fatalf("first delivery reference tasks = %#v, want [task-old]", delivered[0].ReferenceTasks)
+	if delivered[0].TaskID != "task-old" {
+		t.Fatalf("first delivery task id = %q, want %q", delivered[0].TaskID, "task-old")
 	}
 	if delivered[1].ContextID != "ctx-room" {
 		t.Fatalf("second delivery context id = %q, want same context retry", delivered[1].ContextID)
 	}
-	if len(delivered[1].ReferenceTasks) != 0 {
-		t.Fatalf("second delivery reference tasks = %#v, want none for same-context retry", delivered[1].ReferenceTasks)
+	if delivered[1].TaskID != "" {
+		t.Fatalf("second delivery task id = %q, want none for same-context retry", delivered[1].TaskID)
 	}
 	if delivered[2].ContextID == "ctx-room" {
 		t.Fatalf("third delivery context id = %q, want fresh context", delivered[2].ContextID)
 	}
-	if len(delivered[2].ReferenceTasks) != 0 {
-		t.Fatalf("third delivery reference tasks = %#v, want none for fresh context retry", delivered[2].ReferenceTasks)
+	if delivered[2].TaskID != "" {
+		t.Fatalf("third delivery task id = %q, want none for fresh context retry", delivered[2].TaskID)
 	}
 }
 

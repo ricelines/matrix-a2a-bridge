@@ -18,6 +18,7 @@ func TestClientDeliverSendsNonBlockingNotification(t *testing.T) {
 
 	var gotMetadata map[string]any
 	var gotContextID string
+	var gotTaskID a2aproto.TaskID
 	var gotReferenceTaskIDs []a2aproto.TaskID
 	var gotMessageID string
 
@@ -48,6 +49,7 @@ func TestClientDeliverSendsNonBlockingNotification(t *testing.T) {
 			}
 			gotMetadata = params.Metadata
 			gotContextID = params.Message.ContextID
+			gotTaskID = params.Message.TaskID
 			gotReferenceTaskIDs = append([]a2aproto.TaskID(nil), params.Message.ReferenceTasks...)
 			gotMessageID = params.Message.ID
 
@@ -79,6 +81,7 @@ func TestClientDeliverSendsNonBlockingNotification(t *testing.T) {
 	}, DeliveryOptions{
 		MessageID:       "msg-123",
 		ContextID:       "ctx-123",
+		TaskID:          "task-123",
 		ReferenceTaskID: "task-122",
 	})
 	if err != nil {
@@ -94,6 +97,9 @@ func TestClientDeliverSendsNonBlockingNotification(t *testing.T) {
 	}
 	if gotContextID != "ctx-123" {
 		t.Fatalf("message/send contextId = %q, want %q", gotContextID, "ctx-123")
+	}
+	if gotTaskID != "task-123" {
+		t.Fatalf("message/send taskId = %q, want %q", gotTaskID, "task-123")
 	}
 	if len(gotReferenceTaskIDs) != 1 || gotReferenceTaskIDs[0] != "task-122" {
 		t.Fatalf("message/send referenceTaskIds = %#v, want [task-122]", gotReferenceTaskIDs)

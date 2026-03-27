@@ -216,8 +216,8 @@ func TestBridgeMaintainsSeparateRoomHistoriesPerRoom(t *testing.T) {
 	if secondA.ContextID != firstA.ContextID {
 		t.Fatalf("room A second context id = %q, want %q", secondA.ContextID, firstA.ContextID)
 	}
-	if len(secondA.ReferenceTasks) != 1 || secondA.ReferenceTasks[0] != firstA.TaskID {
-		t.Fatalf("room A second reference tasks = %#v, want [%s]", secondA.ReferenceTasks, firstA.TaskID)
+	if secondA.TaskID != firstA.TaskID {
+		t.Fatalf("room A second task id = %q, want %q", secondA.TaskID, firstA.TaskID)
 	}
 	assertHistoryUsesOnlyRoom(t, secondA.History, roomA)
 	assertRoomMessageBodies(t, secondA.History, roomA, []string{"Hi. My name is Alice", "What is my name?"})

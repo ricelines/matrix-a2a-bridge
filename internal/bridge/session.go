@@ -15,9 +15,9 @@ import (
 )
 
 const (
-	taskTerminalPollInterval = 100 * time.Millisecond
-	taskTerminalWaitTimeout  = 30 * time.Second
-	roomQueueRetryDelay      = 1 * time.Second
+	taskReadyPollInterval = 100 * time.Millisecond
+	taskReadyWaitTimeout  = 30 * time.Second
+	roomQueueRetryDelay   = 1 * time.Second
 )
 
 type roomQueue struct {
@@ -115,7 +115,7 @@ func (b *Bridge) deliverRoomUpdate(ctx context.Context, batch roomUpdateBatch) e
 	}
 
 	session := b.loadRoomSession(batch.RoomID)
-	if err := b.waitForRoomTaskTerminal(ctx, &session); err != nil {
+	if err := b.waitForRoomTaskReady(ctx, &session); err != nil {
 		return err
 	}
 
@@ -148,12 +148,12 @@ func (b *Bridge) loadRoomSession(roomID string) state.RoomSession {
 	}
 }
 
-func (b *Bridge) waitForRoomTaskTerminal(ctx context.Context, session *state.RoomSession) error {
+func (b *Bridge) waitForRoomTaskReady(ctx context.Context, session *state.RoomSession) error {
 	if session.LatestTaskID == "" {
 		return nil
 	}
 
-	waitCtx, cancel := context.WithTimeout(ctx, taskTerminalWaitTimeout)
+	waitCtx, cancel := context.WithTimeout(ctx, taskReadyWaitTimeout)
 	defer cancel()
 
 	for {
@@ -165,14 +165,19 @@ func (b *Bridge) waitForRoomTaskTerminal(ctx context.Context, session *state.Roo
 			}
 			return err
 		}
-		if task.Status.State.Terminal() {
+		switch task.Status.State {
+		case a2aproto.TaskStateSubmitted, a2aproto.TaskStateWorking:
+		case a2aproto.TaskStateInputRequired:
+			return nil
+		default:
+			session.LatestTaskID = ""
 			return nil
 		}
 
 		select {
 		case <-waitCtx.Done():
-			return fmt.Errorf("timed out waiting for upstream task %s in room %s to become terminal: %w", session.LatestTaskID, session.RoomID, waitCtx.Err())
-		case <-time.After(taskTerminalPollInterval):
+			return fmt.Errorf("timed out waiting for upstream task %s in room %s to accept another message: %w", session.LatestTaskID, session.RoomID, waitCtx.Err())
+		case <-time.After(taskReadyPollInterval):
 		}
 	}
 }
@@ -192,7 +197,7 @@ func (b *Bridge) deliverWithRecovery(
 	}
 
 	if updatedSession.LatestTaskID != "" {
-		b.log.Warn("room continuation task failed; retrying without reference task",
+		b.log.Warn("room task continuation failed; retrying with same context on a fresh task",
 			"room_id", updatedSession.RoomID,
 			"context_id", updatedSession.ContextID,
 			"failed_task_id", task.ID,
@@ -235,9 +240,9 @@ func (b *Bridge) deliverAttempt(
 	session state.RoomSession,
 ) (*a2aproto.Task, state.RoomSession, error) {
 	task, err := b.upstream.Deliver(ctx, notification, bridgea2a.DeliveryOptions{
-		MessageID:       messageIDForBatch(batch),
-		ContextID:       session.ContextID,
-		ReferenceTaskID: session.LatestTaskID,
+		MessageID: messageIDForBatch(batch),
+		ContextID: session.ContextID,
+		TaskID:    session.LatestTaskID,
 	})
 	if err != nil {
 		return nil, session, err
@@ -251,8 +256,14 @@ func (b *Bridge) deliverAttempt(
 	if task.ContextID == "" {
 		return nil, session, fmt.Errorf("upstream returned task %s without context id", task.ID)
 	}
+	if isContinuationFailure(task) {
+		return task, session, nil
+	}
 	if session.ContextID != "" && task.ContextID != session.ContextID {
 		return nil, session, fmt.Errorf("upstream changed room %s context from %s to %s", session.RoomID, session.ContextID, task.ContextID)
+	}
+	if session.LatestTaskID != "" && string(task.ID) != session.LatestTaskID {
+		return nil, session, fmt.Errorf("upstream changed room %s task from %s to %s", session.RoomID, session.LatestTaskID, task.ID)
 	}
 
 	session.ContextID = task.ContextID
@@ -278,6 +289,8 @@ func isContinuationFailure(task *a2aproto.Task) bool {
 	}
 
 	for _, needle := range []string{
+		"task in a terminal state",
+		"only input_required tasks may be continued",
 		"reference task",
 		"referenced tasks",
 		"referencetaskids",

@@ -164,6 +164,30 @@ type mockTask struct {
 func (m *MockServer) appendHistoryLocked(reqCtx *a2asrv.RequestContext) ([]string, error) {
 	body := currentUserText(reqCtx.Message)
 	contextID := reqCtx.ContextID
+	taskID := string(reqCtx.TaskID)
+
+	if reqCtx.StoredTask != nil {
+		history := make([]string, 0, len(reqCtx.StoredTask.History))
+		for _, msg := range reqCtx.StoredTask.History {
+			if text := currentUserText(msg); text != "" {
+				history = append(history, text)
+			}
+		}
+		if len(history) == 0 && body != "" {
+			history = append(history, body)
+		}
+		existing := m.tasks[taskID]
+		existing.TaskID = taskID
+		existing.ContextID = contextID
+		existing.History = append([]string(nil), history...)
+		m.tasks[taskID] = existing
+		if m.contextTasks[contextID] == nil {
+			m.contextTasks[contextID] = make(map[string]struct{})
+		}
+		m.contextTasks[contextID][taskID] = struct{}{}
+		return append([]string(nil), history...), nil
+	}
+
 	parent, err := m.resolveParentLocked(contextID, reqCtx.Message.ReferenceTasks)
 	if err != nil {
 		return nil, err
@@ -176,7 +200,6 @@ func (m *MockServer) appendHistoryLocked(reqCtx *a2asrv.RequestContext) ([]strin
 		history = append(append([]string(nil), parent.History...), body)
 	}
 
-	taskID := string(reqCtx.TaskID)
 	m.tasks[taskID] = mockTask{
 		TaskID:    taskID,
 		ContextID: contextID,
@@ -233,20 +256,18 @@ type mockExecutor struct {
 }
 
 func (e *mockExecutor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, queue eventqueue.Queue) error {
-	if reqCtx.StoredTask == nil {
-		if err := e.mock.recordExecution(reqCtx); err != nil {
-			msg := a2aproto.NewMessageForTask(
-				a2aproto.MessageRoleAgent,
-				reqCtx,
-				a2aproto.TextPart{Text: err.Error()},
-			)
-			update := a2aproto.NewStatusUpdateEvent(reqCtx, a2aproto.TaskStateFailed, msg)
-			update.Final = true
-			if writeErr := queue.Write(ctx, update); writeErr != nil {
-				return fmt.Errorf("write failed status update: %w", writeErr)
-			}
-			return nil
+	if err := e.mock.recordExecution(reqCtx); err != nil {
+		msg := a2aproto.NewMessageForTask(
+			a2aproto.MessageRoleAgent,
+			reqCtx,
+			a2aproto.TextPart{Text: err.Error()},
+		)
+		update := a2aproto.NewStatusUpdateEvent(reqCtx, a2aproto.TaskStateFailed, msg)
+		update.Final = true
+		if writeErr := queue.Write(ctx, update); writeErr != nil {
+			return fmt.Errorf("write failed status update: %w", writeErr)
 		}
+		return nil
 	}
 
 	msg := a2aproto.NewMessageForTask(
@@ -254,7 +275,7 @@ func (e *mockExecutor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContex
 		reqCtx,
 		a2aproto.TextPart{Text: "received"},
 	)
-	update := a2aproto.NewStatusUpdateEvent(reqCtx, a2aproto.TaskStateCompleted, msg)
+	update := a2aproto.NewStatusUpdateEvent(reqCtx, a2aproto.TaskStateInputRequired, msg)
 	update.Final = true
 
 	if err := queue.Write(ctx, update); err != nil {

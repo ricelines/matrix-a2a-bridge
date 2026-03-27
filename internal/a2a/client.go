@@ -18,6 +18,7 @@ type Notification struct {
 type DeliveryOptions struct {
 	MessageID       string
 	ContextID       string
+	TaskID          string
 	ReferenceTaskID string
 }
 
@@ -58,6 +59,9 @@ func (c *Client) Deliver(ctx context.Context, notification Notification, options
 	}
 	if options.ContextID != "" {
 		message.ContextID = options.ContextID
+	}
+	if options.TaskID != "" {
+		message.TaskID = a2aproto.TaskID(options.TaskID)
 	}
 	if options.ReferenceTaskID != "" {
 		message.ReferenceTasks = []a2aproto.TaskID{a2aproto.TaskID(options.ReferenceTaskID)}
