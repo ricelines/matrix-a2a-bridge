@@ -17,6 +17,8 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      GOFLAGS: -tags=goolm
 
     steps:
       - name: Check out source

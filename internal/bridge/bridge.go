@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"maunium.net/go/mautrix"
+	"maunium.net/go/mautrix/crypto/cryptohelper"
 	"maunium.net/go/mautrix/id"
 
 	"matrix-a2a-bridge/internal/a2a"
@@ -26,10 +27,13 @@ type Bridge struct {
 	log      *slog.Logger
 	state    *state.Store
 	upstream *a2a.Client
+	crypto   *cryptohelper.CryptoHelper
 
-	runCtx  context.Context
-	roomsMu sync.Mutex
-	rooms   map[string]*roomQueue
+	runCtx      context.Context
+	roomsMu     sync.Mutex
+	rooms       map[string]*roomQueue
+	collectorMu sync.Mutex
+	collector   *syncEventCollector
 }
 
 const (
@@ -73,8 +77,21 @@ func New(cfg config.Config, logger *slog.Logger) (*Bridge, error) {
 
 func (b *Bridge) Run(ctx context.Context) error {
 	b.runCtx = ctx
-	if err := b.authenticate(ctx); err != nil {
-		return err
+	for {
+		if err := b.authenticate(ctx); err != nil {
+			return err
+		}
+		if err := b.initializeCrypto(ctx); err != nil {
+			if !errors.Is(err, mautrix.MUnknownToken) || !b.canRelogin() {
+				return err
+			}
+			b.log.Warn("matrix session expired during crypto initialization, attempting to re-authenticate")
+			if err := b.loginWithPassword(ctx); err != nil {
+				return fmt.Errorf("re-authenticate after unknown token: %w", err)
+			}
+			continue
+		}
+		break
 	}
 
 	upstreamClient, err := a2a.New(ctx, b.config.UpstreamA2AURL)
@@ -196,7 +213,7 @@ func usernameForLogin(input string) string {
 
 func (b *Bridge) registerHandlers() {
 	syncer := b.client.Syncer.(*mautrix.DefaultSyncer)
-	syncer.OnSync(b.handleSyncResponse)
+	syncer.OnEvent(b.handleMatrixEvent)
 }
 
 func (b *Bridge) syncWithResume(ctx context.Context) error {
@@ -260,8 +277,13 @@ func (b *Bridge) syncWithResume(ctx context.Context) error {
 		if nextBatch == "" {
 			stripInitialBacklog(resp)
 		}
+		collector := b.beginEventCollection()
 		if err := b.client.Syncer.ProcessResponse(ctx, resp, nextBatch); err != nil {
+			b.finishEventCollection(collector)
 			return fmt.Errorf("process sync response: %w", err)
+		}
+		for _, batch := range b.finishEventCollection(collector) {
+			b.enqueueRoomUpdate(ctx, batch)
 		}
 
 		nextBatch = resp.NextBatch

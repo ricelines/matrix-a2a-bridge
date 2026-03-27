@@ -33,78 +33,128 @@ type roomUpdateBatch struct {
 }
 
 func (b *Bridge) handleSyncResponse(ctx context.Context, resp *mautrix.RespSync, _ string) bool {
-	for _, batch := range b.collectRoomUpdateBatches(resp) {
+	for _, batch := range b.collectRoomEventBatches(resp) {
 		b.enqueueRoomUpdate(ctx, batch)
 	}
 	return false
 }
 
-func (b *Bridge) collectRoomUpdateBatches(resp *mautrix.RespSync) []roomUpdateBatch {
+func (b *Bridge) handleMatrixEvent(ctx context.Context, evt *event.Event) {
+	batch, ok := b.buildRoomUpdateBatchForEvent(evt)
+	if !ok {
+		return
+	}
+
+	if collector := b.currentCollector(); collector != nil {
+		collector.add(batch)
+		return
+	}
+
+	b.enqueueRoomUpdate(ctx, batch)
+}
+
+func (b *Bridge) collectRoomEventBatches(resp *mautrix.RespSync) []roomUpdateBatch {
 	if resp == nil {
 		return nil
 	}
 
-	var batches []roomUpdateBatch
+	collector := newSyncEventCollector()
 	for roomID, roomData := range resp.Rooms.Join {
 		stateEvents := roomData.State.Events
 		if roomData.StateAfter != nil {
 			stateEvents = roomData.StateAfter.Events
 		}
-		if batch, ok := b.buildRoomUpdateBatch(roomID, "join", stateEvents, roomData.Timeline.Events); ok {
-			batches = append(batches, batch)
+		for _, evt := range stateEvents {
+			if evt == nil {
+				continue
+			}
+			cloned := cloneEvent(evt)
+			cloned.RoomID = roomID
+			cloned.Mautrix.EventSource = event.SourceJoin | event.SourceState
+			if batch, ok := b.buildRoomUpdateBatchForEvent(cloned); ok {
+				collector.add(batch)
+			}
+		}
+		for _, evt := range roomData.Timeline.Events {
+			if evt == nil {
+				continue
+			}
+			cloned := cloneEvent(evt)
+			cloned.RoomID = roomID
+			cloned.Mautrix.EventSource = event.SourceJoin | event.SourceTimeline
+			if batch, ok := b.buildRoomUpdateBatchForEvent(cloned); ok {
+				collector.add(batch)
+			}
 		}
 	}
 	for roomID, roomData := range resp.Rooms.Invite {
-		if batch, ok := b.buildRoomUpdateBatch(roomID, "invite", roomData.State.Events, nil); ok {
-			batches = append(batches, batch)
+		for _, evt := range roomData.State.Events {
+			if evt == nil {
+				continue
+			}
+			cloned := cloneEvent(evt)
+			cloned.RoomID = roomID
+			cloned.Mautrix.EventSource = event.SourceInvite | event.SourceState
+			if batch, ok := b.buildRoomUpdateBatchForEvent(cloned); ok {
+				collector.add(batch)
+			}
 		}
 	}
 	for roomID, roomData := range resp.Rooms.Leave {
-		if batch, ok := b.buildRoomUpdateBatch(roomID, "leave", roomData.State.Events, roomData.Timeline.Events); ok {
-			batches = append(batches, batch)
+		for _, evt := range roomData.State.Events {
+			if evt == nil {
+				continue
+			}
+			cloned := cloneEvent(evt)
+			cloned.RoomID = roomID
+			cloned.Mautrix.EventSource = event.SourceLeave | event.SourceState
+			if batch, ok := b.buildRoomUpdateBatchForEvent(cloned); ok {
+				collector.add(batch)
+			}
+		}
+		for _, evt := range roomData.Timeline.Events {
+			if evt == nil {
+				continue
+			}
+			cloned := cloneEvent(evt)
+			cloned.RoomID = roomID
+			cloned.Mautrix.EventSource = event.SourceLeave | event.SourceTimeline
+			if batch, ok := b.buildRoomUpdateBatchForEvent(cloned); ok {
+				collector.add(batch)
+			}
 		}
 	}
-	return batches
+	return collector.flush()
 }
 
-func (b *Bridge) buildRoomUpdateBatch(roomID id.RoomID, roomSection string, stateEvents, timelineEvents []*event.Event) (roomUpdateBatch, bool) {
-	stateSegment := b.filterRoomEvents(roomID, roomSection, "state", stateEvents)
-	timelineSegment := b.filterRoomEvents(roomID, roomSection, "timeline", timelineEvents)
-	if len(stateSegment) == 0 && len(timelineSegment) == 0 {
+func (b *Bridge) buildRoomUpdateBatchForEvent(evt *event.Event) (roomUpdateBatch, bool) {
+	if !shouldForwardEvent(b.client.UserID, evt) {
+		return roomUpdateBatch{}, false
+	}
+	if evt != nil && evt.ID != "" && b.state.IsHandled(evt.ID.String()) {
+		return roomUpdateBatch{}, false
+	}
+
+	roomSection, eventSection, ok := eventSourceSections(evt.Mautrix.EventSource)
+	if !ok {
+		return roomUpdateBatch{}, false
+	}
+
+	cloned := cloneEvent(evt)
+	segment := roomUpdateSegment{RoomSection: roomSection}
+	switch eventSection {
+	case "state":
+		segment.State = []*event.Event{cloned}
+	case "timeline":
+		segment.Timeline = []*event.Event{cloned}
+	default:
 		return roomUpdateBatch{}, false
 	}
 
 	return roomUpdateBatch{
-		RoomID: roomID.String(),
-		Updates: []roomUpdateSegment{{
-			RoomSection: roomSection,
-			State:       stateSegment,
-			Timeline:    timelineSegment,
-		}},
+		RoomID:  evt.RoomID.String(),
+		Updates: []roomUpdateSegment{segment},
 	}, true
-}
-
-func (b *Bridge) filterRoomEvents(roomID id.RoomID, roomSection, eventSection string, events []*event.Event) []*event.Event {
-	source, ok := roomEventSource(roomSection, eventSection)
-	if !ok {
-		return nil
-	}
-
-	filtered := make([]*event.Event, 0, len(events))
-	for _, evt := range events {
-		if !shouldForwardEventSource(b.client.UserID, evt, source) {
-			continue
-		}
-		if evt != nil && evt.ID != "" && b.state.IsHandled(evt.ID.String()) {
-			continue
-		}
-
-		cloned := cloneEvent(evt)
-		cloned.RoomID = roomID
-		cloned.Mautrix.EventSource = source
-		filtered = append(filtered, cloned)
-	}
-	return filtered
 }
 
 func buildRoomUpdateNotification(self id.UserID, homeserverURL string, batch roomUpdateBatch) (a2a.Notification, error) {
@@ -141,31 +191,6 @@ func buildRoomUpdateNotification(self id.UserID, homeserverURL string, batch roo
 	}, nil
 }
 
-func roomEventSource(roomSection, eventSection string) (event.Source, bool) {
-	var source event.Source
-	switch roomSection {
-	case "join":
-		source = event.SourceJoin
-	case "invite":
-		source = event.SourceInvite
-	case "leave":
-		source = event.SourceLeave
-	default:
-		return 0, false
-	}
-
-	switch eventSection {
-	case "timeline":
-		source |= event.SourceTimeline
-	case "state":
-		source |= event.SourceState
-	default:
-		return 0, false
-	}
-
-	return source, true
-}
-
 func shouldForwardEvent(self id.UserID, evt *event.Event) bool {
 	if evt == nil {
 		return false
@@ -175,6 +200,9 @@ func shouldForwardEvent(self id.UserID, evt *event.Event) bool {
 
 func shouldForwardEventSource(self id.UserID, evt *event.Event, source event.Source) bool {
 	if evt == nil {
+		return false
+	}
+	if evt.Type == event.EventEncrypted && source&event.SourceDecrypted == 0 {
 		return false
 	}
 	if evt.Sender != "" && evt.Sender == self {

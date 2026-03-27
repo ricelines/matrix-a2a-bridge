@@ -103,6 +103,28 @@ func TestShouldForwardEvent(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "raw encrypted timeline event is ignored until decrypted",
+			evt: &event.Event{
+				Sender: id.UserID("@alice:test"),
+				Type:   event.EventEncrypted,
+				Mautrix: event.MautrixInfo{
+					EventSource: event.SourceJoin | event.SourceTimeline,
+				},
+			},
+			want: false,
+		},
+		{
+			name: "decrypted timeline event forwards",
+			evt: &event.Event{
+				Sender: id.UserID("@alice:test"),
+				Type:   event.EventMessage,
+				Mautrix: event.MautrixInfo{
+					EventSource: event.SourceJoin | event.SourceTimeline | event.SourceDecrypted,
+				},
+			},
+			want: true,
+		},
+		{
 			name: "self-authored event is ignored",
 			evt: &event.Event{
 				Sender: self,
@@ -357,6 +379,64 @@ func TestHandleSyncResponseMergesPendingUpdatesWhileTaskActive(t *testing.T) {
 	}
 	if got := roomMessageBodiesFromUpdate(second); !equalStrings(got, []string{"second", "third"}) {
 		t.Fatalf("merged message bodies = %#v, want [second third]", got)
+	}
+}
+
+func TestRunRoomQueueRetriesFailedDelivery(t *testing.T) {
+	var sendCalls int
+
+	server := newLocalServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case a2asrv.WellKnownAgentCardPath:
+			a2asrv.NewStaticAgentCardHandler(testAgentCard(serverBaseURL(r))).ServeHTTP(w, r)
+			return
+		case "/rpc":
+		default:
+			http.NotFound(w, r)
+			return
+		}
+
+		req := decodeJSONRPCRequest(t, r)
+		switch req.Method {
+		case "message/send":
+			sendCalls++
+			if sendCalls == 1 {
+				http.Error(w, "temporary failure", http.StatusBadGateway)
+				return
+			}
+			var params a2aproto.MessageSendParams
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				t.Fatalf("Unmarshal(message/send params) error = %v", err)
+			}
+			writeJSONRPCResponse(t, w, req.ID, map[string]any{
+				"kind":      "task",
+				"id":        "task-retry",
+				"contextId": params.Message.ContextID,
+				"status": map[string]any{
+					"state": "submitted",
+				},
+			})
+		default:
+			t.Fatalf("unexpected JSON-RPC method %q", req.Method)
+		}
+	}))
+
+	upstreamClient, err := a2a.New(context.Background(), server.URL)
+	if err != nil {
+		t.Fatalf("a2a.New() error = %v", err)
+	}
+	store, err := state.Open(filepath.Join(t.TempDir(), "bridge-state.json"))
+	if err != nil {
+		t.Fatalf("state.Open() error = %v", err)
+	}
+
+	matrixBridge := newTestBridge(t, store, upstreamClient)
+	evt := messageEvent("$evt-retry", "!room:test", "@alice:test", "retry me")
+	matrixBridge.handleSyncResponse(context.Background(), syncResponseForEvents(evt), "")
+
+	waitForLen(t, func() int { return sendCalls }, 2, "failed room delivery was not retried")
+	if !store.IsHandled(evt.ID.String()) {
+		t.Fatalf("expected retried event %s to be marked handled", evt.ID)
 	}
 }
 

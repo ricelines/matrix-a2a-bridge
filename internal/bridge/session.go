@@ -17,6 +17,7 @@ import (
 const (
 	taskTerminalPollInterval = 100 * time.Millisecond
 	taskTerminalWaitTimeout  = 30 * time.Second
+	roomQueueRetryDelay      = 1 * time.Second
 )
 
 type roomQueue struct {
@@ -89,6 +90,20 @@ func (b *Bridge) runRoomQueue(ctx context.Context, queue *roomQueue) {
 				"room_id", batch.RoomID,
 				"err", err,
 			)
+			if ctx.Err() != nil {
+				return
+			}
+
+			queue.mu.Lock()
+			queue.pending = mergeRoomUpdateBatches(batch, queue.pending)
+			queue.hasPending = true
+			queue.mu.Unlock()
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(roomQueueRetryDelay):
+			}
 		}
 	}
 }
