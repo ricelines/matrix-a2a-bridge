@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"maunium.net/go/mautrix"
+	"maunium.net/go/mautrix/crypto/cryptohelper"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
@@ -146,6 +147,59 @@ func TestBridgeForwardsJoinedRoomMessagesWithoutReplying(t *testing.T) {
 	suite.alice.waitForNoMessageFrom(t, roomID, suite.botUserID, noActivityWindow)
 }
 
+func TestBridgeForwardsDecryptedEventsFromEncryptedRooms(t *testing.T) {
+	suite := sharedLiveSuite(t)
+
+	roomID := suite.createEncryptedPrivateRoomWithBotInvite(t)
+	suite.joinRoomAsBot(t, roomID)
+	waitForJoinedMember(t, suite.aliceE2EE.client, roomID, suite.botUserID, 20*time.Second)
+	suite.aliceE2EE.shareGroupSession(t, roomID, suite.aliceUserID, suite.botUserID)
+
+	warmupBaseline := suite.upstream.NotificationCount()
+	suite.aliceE2EE.sendText(t, roomID, "warmup from the encrypted room")
+	suite.waitForNotificationSince(t, warmupBaseline, eventForwardTimeout, func(n forwardedNotification) bool {
+		return n.Kind == "matrix_room_update" &&
+			n.RoomID == roomID.String() &&
+			hasMatchingForwardedTimelineEvent(n, func(evt forwardedNotificationEvt) bool {
+				return evt.Sender == suite.aliceUserID.String() &&
+					evt.Type == event.EventMessage.String() &&
+					evt.Content["body"] == "warmup from the encrypted room"
+			})
+	}, "warmup encrypted-room message was not forwarded upstream")
+
+	baseline := suite.upstream.NotificationCount()
+	body := "hello from the encrypted room"
+	suite.aliceE2EE.sendText(t, roomID, body)
+
+	notification := suite.waitForNotificationSince(t, baseline, 10*time.Second, func(n forwardedNotification) bool {
+		return n.Kind == "matrix_room_update" &&
+			n.RoomID == roomID.String() &&
+			hasMatchingForwardedTimelineEvent(n, func(evt forwardedNotificationEvt) bool {
+				return evt.Sender == suite.aliceUserID.String() &&
+					evt.Type == event.EventMessage.String() &&
+					evt.Content["body"] == body
+			})
+	}, "decrypted encrypted-room message was not forwarded upstream")
+
+	if hasMatchingForwardedTimelineEvent(notification, func(evt forwardedNotificationEvt) bool {
+		return evt.Type == event.EventEncrypted.String()
+	}) {
+		t.Fatalf("notification unexpectedly contained raw encrypted timeline content: %#v", notification)
+	}
+
+	for _, recorded := range suite.upstream.Notifications()[baseline:] {
+		decoded := decodeNotification(t, recorded.Body)
+		if decoded.RoomID != roomID.String() {
+			continue
+		}
+		if hasMatchingForwardedTimelineEvent(decoded, func(evt forwardedNotificationEvt) bool {
+			return evt.Type == event.EventEncrypted.String()
+		}) {
+			t.Fatalf("notification unexpectedly contained raw encrypted timeline content: %#v", decoded)
+		}
+	}
+}
+
 func TestBridgeIgnoresSelfAuthoredMessages(t *testing.T) {
 	suite := sharedLiveSuite(t)
 
@@ -236,6 +290,7 @@ type liveSuite struct {
 	server      *tuwunelContainer
 	upstream    *a2a.MockServer
 	alice       *syncingClient
+	aliceE2EE   *syncingClient
 	botControl  *mautrix.Client
 	bridgeRun   *runningBridge
 	bridgeLog   *bytes.Buffer
@@ -292,8 +347,22 @@ func startLiveSuite() (*liveSuite, error) {
 		return nil, err
 	}
 
+	aliceE2EE, err := startCryptoSyncingClient(
+		server.baseURL(),
+		aliceUser,
+		alicePassword,
+		filepath.Join(server.tempDir, "alice-e2ee.db"),
+	)
+	if err != nil {
+		_ = alice.Close()
+		upstream.Close()
+		_ = server.Close()
+		return nil, err
+	}
+
 	botControl, err := newLoggedInClient(server.baseURL(), botUser, botPassword)
 	if err != nil {
+		_ = aliceE2EE.Close()
 		_ = alice.Close()
 		upstream.Close()
 		_ = server.Close()
@@ -304,6 +373,7 @@ func startLiveSuite() (*liveSuite, error) {
 	statePath := filepath.Join(server.tempDir, "bridge-state.json")
 	bridgeRun, err := startBridgeRuntime(server.baseURL(), upstream.BaseURL(), statePath, bridgeLog)
 	if err != nil {
+		_ = aliceE2EE.Close()
 		_ = alice.Close()
 		upstream.Close()
 		_ = server.Close()
@@ -314,6 +384,7 @@ func startLiveSuite() (*liveSuite, error) {
 		server:      server,
 		upstream:    upstream,
 		alice:       alice,
+		aliceE2EE:   aliceE2EE,
 		botControl:  botControl,
 		bridgeRun:   bridgeRun,
 		bridgeLog:   bridgeLog,
@@ -358,6 +429,11 @@ func (s *liveSuite) Close() error {
 			errs = append(errs, err)
 		}
 	}
+	if s.aliceE2EE != nil {
+		if err := s.aliceE2EE.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if s.upstream != nil {
 		s.upstream.Close()
 	}
@@ -382,6 +458,38 @@ func (s *liveSuite) createPrivateRoomWithBotInvite(t *testing.T) id.RoomID {
 	}
 
 	if _, err := s.alice.client.InviteUser(context.Background(), room.RoomID, &mautrix.ReqInviteUser{
+		UserID: s.botUserID,
+	}); err != nil {
+		t.Fatalf("InviteUser() error = %v", err)
+	}
+
+	return room.RoomID
+}
+
+func (s *liveSuite) createEncryptedPrivateRoomWithBotInvite(t *testing.T) id.RoomID {
+	t.Helper()
+
+	room, err := s.aliceE2EE.client.CreateRoom(context.Background(), &mautrix.ReqCreateRoom{
+		Preset:   "private_chat",
+		IsDirect: false,
+	})
+	if err != nil {
+		t.Fatalf("CreateRoom() error = %v", err)
+	}
+
+	if _, err := s.aliceE2EE.client.SendStateEvent(
+		context.Background(),
+		room.RoomID,
+		event.StateEncryption,
+		"",
+		&event.EncryptionEventContent{Algorithm: id.AlgorithmMegolmV1},
+	); err != nil {
+		t.Fatalf("SendStateEvent(m.room.encryption) error = %v", err)
+	}
+
+	waitForEncryptedRoom(t, s.aliceE2EE.client, room.RoomID, 10*time.Second)
+
+	if _, err := s.aliceE2EE.client.InviteUser(context.Background(), room.RoomID, &mautrix.ReqInviteUser{
 		UserID: s.botUserID,
 	}); err != nil {
 		t.Fatalf("InviteUser() error = %v", err)
@@ -713,6 +821,7 @@ func (c *tuwunelContainer) logs() string {
 
 type syncingClient struct {
 	client        *mautrix.Client
+	cryptoHelper  *cryptohelper.CryptoHelper
 	messageEvents chan *event.Event
 	cancel        context.CancelFunc
 	done          chan error
@@ -744,6 +853,59 @@ func startSyncingClient(homeserverURL, username, password string) (*syncingClien
 	return sc, nil
 }
 
+func startCryptoSyncingClient(homeserverURL, username, password, cryptoDBPath string) (*syncingClient, error) {
+	client, err := mautrix.NewClient(homeserverURL, "", "")
+	if err != nil {
+		return nil, fmt.Errorf("NewClient() error = %w", err)
+	}
+	client.DefaultHTTPRetries = 3
+	client.DefaultHTTPBackoff = 2 * time.Second
+
+	sc := &syncingClient{
+		client:        client,
+		messageEvents: make(chan *event.Event, 256),
+		done:          make(chan error, 1),
+	}
+
+	syncer := client.Syncer.(*mautrix.DefaultSyncer)
+	syncer.OnEventType(event.EventMessage, func(ctx context.Context, evt *event.Event) {
+		sc.messageEvents <- evt
+	})
+
+	helper, err := cryptohelper.NewCryptoHelper(client, []byte("0123456789abcdef0123456789abcdef"), cryptoDBPath)
+	if err != nil {
+		return nil, fmt.Errorf("NewCryptoHelper() error = %w", err)
+	}
+	helper.LoginAs = &mautrix.ReqLogin{
+		Type: mautrix.AuthTypePassword,
+		Identifier: mautrix.UserIdentifier{
+			Type: mautrix.IdentifierTypeUser,
+			User: username,
+		},
+		Password:                 password,
+		InitialDeviceDisplayName: "matrix-a2a-bridge-live-test",
+	}
+	if err := helper.Init(context.Background()); err != nil {
+		_ = helper.Close()
+		return nil, fmt.Errorf("Init() error = %w", err)
+	}
+	if err := helper.Machine().ShareKeys(context.Background(), 50); err != nil {
+		_ = helper.Close()
+		return nil, fmt.Errorf("ShareKeys() error = %w", err)
+	}
+
+	client.Crypto = helper
+	sc.cryptoHelper = helper
+
+	ctx, cancel := context.WithCancel(context.Background())
+	sc.cancel = cancel
+	go func() {
+		sc.done <- client.SyncWithContext(ctx)
+	}()
+
+	return sc, nil
+}
+
 func (c *syncingClient) Close() error {
 	if c == nil {
 		return nil
@@ -752,10 +914,14 @@ func (c *syncingClient) Close() error {
 	c.cancel()
 	select {
 	case err := <-c.done:
-		if err != nil && !errors.Is(err, context.Canceled) {
-			return fmt.Errorf("sync client stopped with error: %w", err)
+		var closeErr error
+		if c.cryptoHelper != nil {
+			closeErr = c.cryptoHelper.Close()
 		}
-		return nil
+		if err != nil && !errors.Is(err, context.Canceled) {
+			return errors.Join(fmt.Errorf("sync client stopped with error: %w", err), closeErr)
+		}
+		return closeErr
 	case <-time.After(10 * time.Second):
 		return fmt.Errorf("timed out stopping sync client")
 	}
@@ -797,6 +963,16 @@ func (c *syncingClient) sendText(t *testing.T, roomID id.RoomID, body string) {
 	}
 }
 
+func (c *syncingClient) shareGroupSession(t *testing.T, roomID id.RoomID, users ...id.UserID) {
+	t.Helper()
+	if c == nil || c.cryptoHelper == nil {
+		t.Fatal("shareGroupSession requires a crypto-enabled syncing client")
+	}
+	if err := c.cryptoHelper.Machine().ShareGroupSession(context.Background(), roomID, users); err != nil {
+		t.Fatalf("ShareGroupSession(%s) error = %v", roomID, err)
+	}
+}
+
 func waitForJoinedMember(t *testing.T, client *mautrix.Client, roomID id.RoomID, userID id.UserID, timeout time.Duration) {
 	t.Helper()
 
@@ -811,6 +987,20 @@ func waitForJoinedMember(t *testing.T, client *mautrix.Client, roomID id.RoomID,
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for join membership for %s in room %s", userID, roomID)
+}
+
+func waitForEncryptedRoom(t *testing.T, client *mautrix.Client, roomID id.RoomID, timeout time.Duration) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		encrypted, err := client.StateStore.IsEncrypted(context.Background(), roomID)
+		if err == nil && encrypted {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for encrypted state for room %s", roomID)
 }
 
 func (c *syncingClient) waitForNoMessageFrom(t *testing.T, roomID id.RoomID, sender id.UserID, timeout time.Duration) {

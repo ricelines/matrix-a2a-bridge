@@ -222,7 +222,7 @@ func TestBuildRoomUpdateNotificationIncludesBatchEnvelope(t *testing.T) {
 	}
 }
 
-func TestHandleSyncResponseDeliversOnceAndMarksHandled(t *testing.T) {
+func TestSyncDispatchDeliversOnceAndMarksHandled(t *testing.T) {
 	upstream := a2a.StartMockServer()
 	defer upstream.Close()
 
@@ -238,13 +238,13 @@ func TestHandleSyncResponseDeliversOnceAndMarksHandled(t *testing.T) {
 	matrixBridge := newTestBridge(t, store, upstreamClient)
 	evt := messageEvent("$evt-1", "!room:test", "@alice:test", "hello")
 
-	matrixBridge.handleSyncResponse(context.Background(), syncResponseForEvents(evt), "")
+	processSyncResponse(t, matrixBridge, syncResponseForEvents(evt))
 	waitForNotificationCount(t, upstream, 1)
 	if !store.IsHandled(evt.ID.String()) {
 		t.Fatalf("expected event %s to be marked handled", evt.ID)
 	}
 
-	matrixBridge.handleSyncResponse(context.Background(), syncResponseForEvents(evt), "")
+	processSyncResponse(t, matrixBridge, syncResponseForEvents(evt))
 	waitForStableNotificationCount(t, upstream, 1)
 
 	notifications := upstream.Notifications()
@@ -253,7 +253,56 @@ func TestHandleSyncResponseDeliversOnceAndMarksHandled(t *testing.T) {
 	}
 }
 
-func TestHandleSyncResponseBatchesRoomStateAndTimelineIntoOneNotification(t *testing.T) {
+func TestEncryptedTimelineEventsForwardAfterDecryption(t *testing.T) {
+	upstream := a2a.StartMockServer()
+	defer upstream.Close()
+
+	upstreamClient, err := a2a.New(context.Background(), upstream.BaseURL())
+	if err != nil {
+		t.Fatalf("a2a.New() error = %v", err)
+	}
+	store, err := state.Open(filepath.Join(t.TempDir(), "bridge-state.json"))
+	if err != nil {
+		t.Fatalf("state.Open() error = %v", err)
+	}
+
+	matrixBridge := newTestBridge(t, store, upstreamClient)
+	processSyncResponse(t, matrixBridge, syncResponseForEvents(encryptedEvent("$evt-enc", "!room:test", "@alice:test")))
+	waitForStableNotificationCount(t, upstream, 0)
+
+	decrypted := messageEvent("$evt-enc", "!room:test", "@alice:test", "hello from encrypted room")
+	decrypted.Mautrix.EventSource = 0
+	matrixBridge.handleDecryptedEvent(context.Background(), decrypted)
+	waitForNotificationCount(t, upstream, 1)
+	waitForStableNotificationCount(t, upstream, 1)
+
+	notifications := upstream.Notifications()
+	if len(notifications) != 1 {
+		t.Fatalf("notification count = %d, want 1", len(notifications))
+	}
+
+	decoded := decodeRoomUpdateNotification(t, notifications[0].Body)
+	if got := roomMessageBodiesFromUpdate(decoded); !equalStrings(got, []string{"hello from encrypted room"}) {
+		t.Fatalf("notification message bodies = %#v, want [hello from encrypted room]", got)
+	}
+	for _, update := range decoded.Updates {
+		for _, evt := range update.State {
+			if evt != nil && evt.Type == event.EventEncrypted {
+				t.Fatalf("notification unexpectedly included encrypted state event: %#v", evt)
+			}
+		}
+		for _, evt := range update.Timeline {
+			if evt != nil && evt.Type == event.EventEncrypted {
+				t.Fatalf("notification unexpectedly included encrypted timeline event: %#v", evt)
+			}
+		}
+	}
+	if !store.IsHandled("$evt-enc") {
+		t.Fatal("expected decrypted event id to be marked handled")
+	}
+}
+
+func TestSyncDispatchBatchesRoomStateAndTimelineIntoOneNotification(t *testing.T) {
 	upstream := a2a.StartMockServer()
 	defer upstream.Close()
 
@@ -270,7 +319,7 @@ func TestHandleSyncResponseBatchesRoomStateAndTimelineIntoOneNotification(t *tes
 	stateEvt := memberInviteEvent("$invite-1", "!room:test", "@alice:test", "@bridge:test")
 	messageEvt := messageEvent("$msg-1", "!room:test", "@alice:test", "hello")
 
-	matrixBridge.handleSyncResponse(context.Background(), syncResponseForEvents(stateEvt, messageEvt), "")
+	processSyncResponse(t, matrixBridge, syncResponseForEvents(stateEvt, messageEvt))
 	waitForNotificationCount(t, upstream, 1)
 
 	notifications := upstream.Notifications()
@@ -286,7 +335,7 @@ func TestHandleSyncResponseBatchesRoomStateAndTimelineIntoOneNotification(t *tes
 	}
 }
 
-func TestHandleSyncResponseMergesPendingUpdatesWhileTaskActive(t *testing.T) {
+func TestSyncDispatchMergesPendingUpdatesWhileTaskActive(t *testing.T) {
 	type deliveredMessage struct {
 		Body      string
 		ContextID string
@@ -356,11 +405,11 @@ func TestHandleSyncResponseMergesPendingUpdatesWhileTaskActive(t *testing.T) {
 
 	matrixBridge := newTestBridge(t, store, upstreamClient)
 	roomID := id.RoomID("!room:test")
-	matrixBridge.handleSyncResponse(context.Background(), syncResponseForEvents(messageEvent("$evt-1", roomID.String(), "@alice:test", "first")), "")
+	processSyncResponse(t, matrixBridge, syncResponseForEvents(messageEvent("$evt-1", roomID.String(), "@alice:test", "first")))
 	waitForLen(t, func() int { return len(delivered) }, 1, "first batch was not delivered")
 
-	matrixBridge.handleSyncResponse(context.Background(), syncResponseForEvents(messageEvent("$evt-2", roomID.String(), "@alice:test", "second")), "")
-	matrixBridge.handleSyncResponse(context.Background(), syncResponseForEvents(messageEvent("$evt-3", roomID.String(), "@alice:test", "third")), "")
+	processSyncResponse(t, matrixBridge, syncResponseForEvents(messageEvent("$evt-2", roomID.String(), "@alice:test", "second")))
+	processSyncResponse(t, matrixBridge, syncResponseForEvents(messageEvent("$evt-3", roomID.String(), "@alice:test", "third")))
 	waitForStableLen(t, func() int { return len(delivered) }, 1)
 
 	close(allowFinish)
@@ -428,7 +477,7 @@ func TestRunRoomQueueRetriesFailedDelivery(t *testing.T) {
 
 	matrixBridge := newTestBridge(t, store, upstreamClient)
 	evt := messageEvent("$evt-retry", "!room:test", "@alice:test", "retry me")
-	matrixBridge.handleSyncResponse(context.Background(), syncResponseForEvents(evt), "")
+	processSyncResponse(t, matrixBridge, syncResponseForEvents(evt))
 
 	waitForLen(t, func() int { return sendCalls }, 2, "failed room delivery was not retried")
 	if !store.IsHandled(evt.ID.String()) {
@@ -742,15 +791,18 @@ func newTestBridge(t *testing.T, store *state.Store, upstreamClient *a2a.Client)
 		t.Fatalf("mautrix.NewClient() error = %v", err)
 	}
 
-	return &Bridge{
-		client:   client,
-		config:   config.Config{HomeserverURL: "https://matrix.example.com"},
-		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
-		state:    store,
-		upstream: upstreamClient,
-		rooms:    make(map[string]*roomQueue),
-		runCtx:   context.Background(),
+	matrixBridge := &Bridge{
+		client:     client,
+		config:     config.Config{HomeserverURL: "https://matrix.example.com"},
+		log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		state:      store,
+		upstream:   upstreamClient,
+		rooms:      make(map[string]*roomQueue),
+		cryptoEvts: make(map[string]event.Source),
+		runCtx:     context.Background(),
 	}
+	matrixBridge.registerHandlers()
+	return matrixBridge
 }
 
 func messageEvent(eventID, roomID, sender, body string) *event.Event {
@@ -783,6 +835,24 @@ func memberInviteEvent(eventID, roomID, sender, stateKey string) *event.Event {
 		},
 		Mautrix: event.MautrixInfo{
 			EventSource: event.SourceJoin | event.SourceState,
+		},
+	}
+}
+
+func encryptedEvent(eventID, roomID, sender string) *event.Event {
+	return &event.Event{
+		ID:     id.EventID(eventID),
+		RoomID: id.RoomID(roomID),
+		Sender: id.UserID(sender),
+		Type:   event.EventEncrypted,
+		Content: event.Content{
+			Raw: map[string]any{
+				"algorithm":  "m.megolm.v1.aes-sha2",
+				"ciphertext": "opaque",
+			},
+		},
+		Mautrix: event.MautrixInfo{
+			EventSource: event.SourceJoin | event.SourceTimeline,
 		},
 	}
 }
@@ -857,6 +927,44 @@ func syncResponseForEvents(events ...*event.Event) *mautrix.RespSync {
 	}
 
 	return resp
+}
+
+func processSyncResponse(t *testing.T, matrixBridge *Bridge, resp *mautrix.RespSync) {
+	t.Helper()
+
+	collector := matrixBridge.beginEventCollection()
+	dispatcher, ok := matrixBridge.client.Syncer.(mautrix.DispatchableSyncer)
+	if !ok {
+		matrixBridge.finishEventCollection(collector)
+		t.Fatal("client syncer does not implement DispatchableSyncer")
+	}
+
+	dispatchRoomEvents := func(roomID id.RoomID, events []*event.Event, source event.Source) {
+		for _, evt := range events {
+			if evt == nil {
+				continue
+			}
+			cloned := cloneEvent(evt)
+			cloned.RoomID = roomID
+			cloned.Mautrix.EventSource = source
+			dispatcher.Dispatch(context.Background(), cloned)
+		}
+	}
+
+	for roomID, roomData := range resp.Rooms.Join {
+		dispatchRoomEvents(roomID, roomData.State.Events, event.SourceJoin|event.SourceState)
+		dispatchRoomEvents(roomID, roomData.Timeline.Events, event.SourceJoin|event.SourceTimeline)
+	}
+	for roomID, roomData := range resp.Rooms.Invite {
+		dispatchRoomEvents(roomID, roomData.State.Events, event.SourceInvite|event.SourceState)
+	}
+	for roomID, roomData := range resp.Rooms.Leave {
+		dispatchRoomEvents(roomID, roomData.State.Events, event.SourceLeave|event.SourceState)
+		dispatchRoomEvents(roomID, roomData.Timeline.Events, event.SourceLeave|event.SourceTimeline)
+	}
+	for _, batch := range matrixBridge.finishEventCollection(collector) {
+		matrixBridge.enqueueRoomUpdate(context.Background(), batch)
+	}
 }
 
 func waitForNotificationCount(t *testing.T, upstream *a2a.MockServer, want int) {

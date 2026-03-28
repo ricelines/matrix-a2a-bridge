@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
@@ -32,14 +31,12 @@ type roomUpdateBatch struct {
 	Updates []roomUpdateSegment
 }
 
-func (b *Bridge) handleSyncResponse(ctx context.Context, resp *mautrix.RespSync, _ string) bool {
-	for _, batch := range b.collectRoomEventBatches(resp) {
-		b.enqueueRoomUpdate(ctx, batch)
-	}
-	return false
-}
-
 func (b *Bridge) handleMatrixEvent(ctx context.Context, evt *event.Event) {
+	if evt != nil && evt.Type == event.EventEncrypted {
+		b.rememberEncryptedEventSource(evt)
+		return
+	}
+
 	batch, ok := b.buildRoomUpdateBatchForEvent(evt)
 	if !ok {
 		return
@@ -51,80 +48,6 @@ func (b *Bridge) handleMatrixEvent(ctx context.Context, evt *event.Event) {
 	}
 
 	b.enqueueRoomUpdate(ctx, batch)
-}
-
-func (b *Bridge) collectRoomEventBatches(resp *mautrix.RespSync) []roomUpdateBatch {
-	if resp == nil {
-		return nil
-	}
-
-	collector := newSyncEventCollector()
-	for roomID, roomData := range resp.Rooms.Join {
-		stateEvents := roomData.State.Events
-		if roomData.StateAfter != nil {
-			stateEvents = roomData.StateAfter.Events
-		}
-		for _, evt := range stateEvents {
-			if evt == nil {
-				continue
-			}
-			cloned := cloneEvent(evt)
-			cloned.RoomID = roomID
-			cloned.Mautrix.EventSource = event.SourceJoin | event.SourceState
-			if batch, ok := b.buildRoomUpdateBatchForEvent(cloned); ok {
-				collector.add(batch)
-			}
-		}
-		for _, evt := range roomData.Timeline.Events {
-			if evt == nil {
-				continue
-			}
-			cloned := cloneEvent(evt)
-			cloned.RoomID = roomID
-			cloned.Mautrix.EventSource = event.SourceJoin | event.SourceTimeline
-			if batch, ok := b.buildRoomUpdateBatchForEvent(cloned); ok {
-				collector.add(batch)
-			}
-		}
-	}
-	for roomID, roomData := range resp.Rooms.Invite {
-		for _, evt := range roomData.State.Events {
-			if evt == nil {
-				continue
-			}
-			cloned := cloneEvent(evt)
-			cloned.RoomID = roomID
-			cloned.Mautrix.EventSource = event.SourceInvite | event.SourceState
-			if batch, ok := b.buildRoomUpdateBatchForEvent(cloned); ok {
-				collector.add(batch)
-			}
-		}
-	}
-	for roomID, roomData := range resp.Rooms.Leave {
-		for _, evt := range roomData.State.Events {
-			if evt == nil {
-				continue
-			}
-			cloned := cloneEvent(evt)
-			cloned.RoomID = roomID
-			cloned.Mautrix.EventSource = event.SourceLeave | event.SourceState
-			if batch, ok := b.buildRoomUpdateBatchForEvent(cloned); ok {
-				collector.add(batch)
-			}
-		}
-		for _, evt := range roomData.Timeline.Events {
-			if evt == nil {
-				continue
-			}
-			cloned := cloneEvent(evt)
-			cloned.RoomID = roomID
-			cloned.Mautrix.EventSource = event.SourceLeave | event.SourceTimeline
-			if batch, ok := b.buildRoomUpdateBatchForEvent(cloned); ok {
-				collector.add(batch)
-			}
-		}
-	}
-	return collector.flush()
 }
 
 func (b *Bridge) buildRoomUpdateBatchForEvent(evt *event.Event) (roomUpdateBatch, bool) {
@@ -202,7 +125,7 @@ func shouldForwardEventSource(self id.UserID, evt *event.Event, source event.Sou
 	if evt == nil {
 		return false
 	}
-	if evt.Type == event.EventEncrypted && source&event.SourceDecrypted == 0 {
+	if evt.Type == event.EventEncrypted {
 		return false
 	}
 	if evt.Sender != "" && evt.Sender == self {

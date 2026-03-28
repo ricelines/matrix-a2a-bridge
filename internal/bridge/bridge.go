@@ -14,6 +14,7 @@ import (
 
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/crypto/cryptohelper"
+	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
 	"matrix-a2a-bridge/internal/a2a"
@@ -34,6 +35,8 @@ type Bridge struct {
 	rooms       map[string]*roomQueue
 	collectorMu sync.Mutex
 	collector   *syncEventCollector
+	cryptoEvtMu sync.Mutex
+	cryptoEvts  map[string]event.Source
 }
 
 const (
@@ -65,11 +68,12 @@ func New(cfg config.Config, logger *slog.Logger) (*Bridge, error) {
 	client.DefaultHTTPBackoff = 2 * time.Second
 
 	matrixBridge := &Bridge{
-		client: client,
-		config: cfg,
-		log:    logger,
-		state:  stateStore,
-		rooms:  make(map[string]*roomQueue),
+		client:     client,
+		config:     cfg,
+		log:        logger,
+		state:      stateStore,
+		rooms:      make(map[string]*roomQueue),
+		cryptoEvts: make(map[string]event.Source),
 	}
 	matrixBridge.registerHandlers()
 	return matrixBridge, nil

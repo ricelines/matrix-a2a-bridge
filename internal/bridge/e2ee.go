@@ -13,6 +13,8 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 	"maunium.net/go/mautrix/crypto/cryptohelper"
+	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
 )
 
 const (
@@ -40,10 +42,75 @@ func (b *Bridge) initializeCrypto(ctx context.Context) error {
 		_ = helper.Close()
 		return fmt.Errorf("initialize matrix crypto helper: %w", err)
 	}
+	helper.CustomPostDecrypt = b.handleDecryptedEvent
+	helper.DecryptErrorCallback = b.handleDecryptError
 
 	b.client.Crypto = helper
 	b.crypto = helper
 	return nil
+}
+
+func (b *Bridge) handleDecryptedEvent(ctx context.Context, evt *event.Event) {
+	if evt == nil {
+		return
+	}
+
+	source, ok := b.takeEncryptedEventSource(evt.ID)
+	if !ok {
+		if _, _, hasRoomSource := eventSourceSections(evt.Mautrix.EventSource); !hasRoomSource {
+			b.log.Debug("dropping decrypted matrix event without preserved room source",
+				"event_id", evt.ID.String(),
+				"event_type", evt.Type.String(),
+			)
+			return
+		}
+		source = evt.Mautrix.EventSource
+	}
+
+	decrypted := cloneEvent(evt)
+	decrypted.Mautrix.EventSource = source | event.SourceDecrypted
+	b.handleMatrixEvent(ctx, decrypted)
+}
+
+func (b *Bridge) handleDecryptError(evt *event.Event, _ error) {
+	if evt == nil {
+		return
+	}
+	b.takeEncryptedEventSource(evt.ID)
+}
+
+func (b *Bridge) rememberEncryptedEventSource(evt *event.Event) {
+	if evt == nil || evt.ID == "" {
+		return
+	}
+	if _, _, ok := eventSourceSections(evt.Mautrix.EventSource); !ok {
+		return
+	}
+
+	b.cryptoEvtMu.Lock()
+	defer b.cryptoEvtMu.Unlock()
+	if b.cryptoEvts == nil {
+		b.cryptoEvts = make(map[string]event.Source)
+	}
+	b.cryptoEvts[evt.ID.String()] = evt.Mautrix.EventSource
+}
+
+func (b *Bridge) takeEncryptedEventSource(eventID id.EventID) (event.Source, bool) {
+	if eventID == "" {
+		return 0, false
+	}
+
+	b.cryptoEvtMu.Lock()
+	defer b.cryptoEvtMu.Unlock()
+	if b.cryptoEvts == nil {
+		return 0, false
+	}
+
+	source, ok := b.cryptoEvts[eventID.String()]
+	if ok {
+		delete(b.cryptoEvts, eventID.String())
+	}
+	return source, ok
 }
 
 func loadOrCreatePickleKey(path string) ([]byte, error) {
